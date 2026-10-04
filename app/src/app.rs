@@ -14,9 +14,6 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Theme, ThemeMode, WindowExt, tooltip::Tooltip};
 use gpui_kit::*;
 
-#[cfg(debug_assertions)]
-use crate::ToggleInspector;
-
 #[derive(Clone, Copy)]
 struct Palette {
     background: u32,
@@ -2056,7 +2053,7 @@ impl Render for LauncherApp {
                 .into_any_element()
         };
 
-        let root = div()
+        div()
             .flex()
             .size_full()
             .bg(rgb(palette.background))
@@ -2090,14 +2087,7 @@ impl Render for LauncherApp {
                     .gap_6()
                     .child(page_header)
                     .child(page_body),
-            );
-
-        #[cfg(debug_assertions)]
-        let root = root.on_action(cx.listener(|_, _: &ToggleInspector, window, cx| {
-            window.toggle_inspector(cx);
-        }));
-
-        root
+            )
     }
 }
 

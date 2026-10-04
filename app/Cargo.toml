@@ -3,8 +3,16 @@ name = "rs-mc-launcher"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["devtools"]
+devtools = ["dep:gpui-devtools"]
+
 [dependencies]
 gpui-kit.workspace = true
 futures.workspace = true
 reqwest.workspace = true
+gpui-devtools = { workspace = true, optional = true }
 rs-mc-launcher-core = { path = "../core" }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }

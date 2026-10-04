@@ -3,9 +3,6 @@ mod features;
 mod router;
 mod shell;
 
-#[cfg(debug_assertions)]
-gpui_kit::actions!([ToggleInspector]);
-
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -61,11 +58,11 @@ fn main() -> Result<(), reqwest::Error> {
             gpui_kit::component::set_locale(Locale::Ru.tag());
             Theme::change(ThemeMode::Dark, None, cx);
 
-            #[cfg(debug_assertions)]
-            cx.bind_keys([
-                KeyBinding::new("ctrl-shift-i", ToggleInspector, None),
-                KeyBinding::new("cmd-shift-i", ToggleInspector, None),
-            ]);
+            #[cfg(all(feature = "devtools", debug_assertions))]
+            {
+                gpui_devtools::init_with(gpui_devtools::Config::default().key_binding(None), cx);
+                shell::devtools::initialize(cx);
+            }
 
             let window_options = WindowOptions {
                 window_min_size: Some(size(px(900.), px(620.))),
