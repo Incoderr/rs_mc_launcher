@@ -18,3 +18,10 @@ GPUI mouse event and inspector renderer APIs.
 These changes do not alter normal application hitboxes or input handling when
 the inspector is closed. Remove the patch when the upstream GPUI version used
 by GPUI Kit contains equivalent fixes.
+
+## Minecraft installation core
+
+`mc-launcher-core/` vendors the MIT-licensed `mc-launcher-core` 0.1.2 crate.
+The local patch avoids compiling the crate's unused `sysinfo` Windows feature
+set: architecture checks use Rust's target constant, while `sysinfo` remains a
+non-Windows-only dependency for OS version detection.

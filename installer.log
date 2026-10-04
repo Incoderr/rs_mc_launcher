@@ -1,0 +1,8 @@
+JVM info: Eclipse Adoptium - 21.0.12.1 - 21.0.12.1+1-LTS
+java.net.preferIPv4Stack=true
+Exception in thread "main" joptsimple.UnrecognizedOptionException: 'installClient' is not a recognized option
+	at joptsimple.OptionException.unrecognizedOption(OptionException.java:89)
+	at joptsimple.OptionParser.handleLongOptionToken(OptionParser.java:493)
+	at joptsimple.OptionParserState$2.handleArgument(OptionParserState.java:56)
+	at joptsimple.OptionParser.parse(OptionParser.java:433)
+	at net.minecraftforge.installer.SimpleInstaller.main(SimpleInstaller.java:45)

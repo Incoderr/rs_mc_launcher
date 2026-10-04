@@ -1,5 +1,6 @@
 mod app;
 mod features;
+mod platform;
 mod router;
 mod shell;
 
@@ -19,12 +20,14 @@ gpui_kit::assets::icon_assets!(
     [
         Blocks,
         Box,
+        Download,
         House,
         Info,
         Languages,
         LoaderCircle,
         Paintbrush,
         PanelTopClose,
+        Play,
         Puzzle,
     ]
 );

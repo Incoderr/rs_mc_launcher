@@ -2,10 +2,11 @@
 members = ["app", "core"]
 default-members = ["app"]
 resolver = "2"
-exclude = ["vendor/gpui-pre"]
+exclude = ["vendor/gpui-pre", "vendor/mc-launcher-core"]
 
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
+mc-launcher-core = { path = "vendor/mc-launcher-core" }
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +19,12 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 gpui-devtools = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dirs = "6"
+quick-xml = { version = "0.41", features = ["serialize"] }
+tracing = "0.1"
+mc-launcher-core = "0.1.2"
+uuid = { version = "1.23.1", features = ["serde", "v4"] }
+tempfile = "3"
 
 [profile.dev.package]
 gpui-pre = { opt-level = 3 }

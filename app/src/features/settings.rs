@@ -109,6 +109,7 @@ pub struct SettingsState {
     theme: ThemeChoice,
     accent: AccentColor,
     hide_to_tray: bool,
+    download_directory: PathBuf,
 }
 
 impl SettingsState {
@@ -128,6 +129,10 @@ impl SettingsState {
         self.hide_to_tray
     }
 
+    pub fn download_directory(&self) -> &PathBuf {
+        &self.download_directory
+    }
+
     pub fn set_locale(&mut self, locale: Locale) {
         self.locale = locale;
     }
@@ -143,4 +148,9 @@ impl SettingsState {
     pub fn set_hide_to_tray(&mut self, hide_to_tray: bool) {
         self.hide_to_tray = hide_to_tray;
     }
+
+    pub fn set_download_directory(&mut self, path: PathBuf) {
+        self.download_directory = path;
+    }
 }
+use std::path::PathBuf;

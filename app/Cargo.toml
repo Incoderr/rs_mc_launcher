@@ -11,6 +11,13 @@ devtools = ["dep:gpui-devtools"]
 gpui-kit.workspace = true
 futures.workspace = true
 reqwest.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+mc-launcher-core.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
 gpui-devtools = { workspace = true, optional = true }
 rs-mc-launcher-core = { path = "../core" }
 
