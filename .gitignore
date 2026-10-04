@@ -1,0 +1,9 @@
+/target/
+/build/
+/dist/
+*.rs.bk
+*.pdb
+*.dSYM/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,11 @@
+[package]
+name = "rs-mc-launcher-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

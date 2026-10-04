@@ -1,0 +1,10 @@
+[package]
+name = "rs-mc-launcher"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+rs-mc-launcher-core = { path = "../core" }
