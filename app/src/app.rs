@@ -4,7 +4,10 @@ use crate::{
         InstanceProfile, InstanceRuntime, InstanceWorkerEvent, InstancesState, install_profile,
         launch_profile, remove_profile_data,
     },
-    features::mods::{ModCategory, ModDetailTab, ModSample, ModSort, ModsState, SAMPLE_MODS},
+    features::mods::{
+        ModCategory, ModDetailTab, ModSample, ModSort, ModsState, SAMPLE_MODS,
+        catalog::{ModProject, ModSource, search_catalog},
+    },
     features::settings::{AccentColor, Locale, SettingsState, ThemeChoice},
     features::versions::{
         LoaderChoice, LoaderVersionMode, VersionCatalogState, fetch_fabric_game_loaders,
@@ -15,7 +18,7 @@ use crate::{
 use futures::StreamExt;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Button as UiButton, StyledExt};
-use gpui_kit::component::button::{Button as ComponentButton, ButtonVariants as _};
+use gpui_kit::component::button::Button as ComponentButton;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::{ScrollableElement, Scrollbar};
@@ -25,6 +28,7 @@ use gpui_kit::component::{Theme, ThemeMode, WindowExt, tooltip::Tooltip};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::rc::Rc;
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -109,6 +113,7 @@ pub struct LauncherApp {
     profile_name_input: Entity<InputState>,
     loader_version_input: Entity<InputState>,
     manifest_scroll: gpui_kit::base::VirtualListScrollHandle,
+    mods_scroll: gpui_kit::base::VirtualListScrollHandle,
     search_query: String,
     _search_subscription: Subscription,
 }
@@ -128,6 +133,10 @@ impl LauncherApp {
                     let query = input.read(cx).value().to_string();
                     this.search_query = query.clone();
                     this.mods.set_query(query);
+                    this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    if this.active_page == Page::Mods {
+                        this.load_mod_catalog(cx, true);
+                    }
                     cx.notify();
                 }
             });
@@ -176,6 +185,7 @@ impl LauncherApp {
             profile_name_input,
             loader_version_input,
             manifest_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
+            mods_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             search_query: String::new(),
             _search_subscription: search_subscription,
         }
@@ -308,7 +318,41 @@ impl LauncherApp {
         self.mods.set_query(String::new());
         self.search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        if page == Page::Mods {
+            self.load_mod_catalog(cx, false);
+        }
         cx.notify();
+    }
+
+    fn load_mod_catalog(&mut self, cx: &mut Context<Self>, debounce: bool) {
+        let (request_id, query, sort, source) = self.mods.begin_search();
+        let client = cx.http_client();
+        let curseforge_api_key = std::env::var("CURSEFORGE_API_KEY").ok();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let still_current = this
+                    .update(cx, |this, _| this.mods.is_current_request(request_id))
+                    .unwrap_or(false);
+                if !still_current {
+                    return;
+                }
+            }
+
+            let result = search_catalog(client, query, sort, source, curseforge_api_key).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mods.finish_search(request_id, result) {
+                    this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn load_version_manifests(&mut self, cx: &mut Context<Self>) {
@@ -2056,6 +2100,7 @@ impl LauncherApp {
     fn mods_page(&self, palette: Palette, locale: Locale, cx: &Context<Self>) -> AnyElement {
         let selected_category = self.mods.category();
         let selected_sort = self.mods.sort();
+        let selected_source = self.mods.source();
         let categories: Vec<_> = ModCategory::ALL
             .into_iter()
             .map(|category| {
@@ -2080,9 +2125,40 @@ impl LauncherApp {
                     .accessibility_label(category.title(locale))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.mods.set_category(category);
+                        this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
                         cx.notify();
                     }))
                     .child(category.title(locale))
+                    .into_any_element()
+            })
+            .collect();
+
+        let sources: Vec<_> = ModSource::FILTERS
+            .into_iter()
+            .map(|source| {
+                let is_selected = source == selected_source;
+                UiButton::new(format!("mods-source-{source:?}"))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.))
+                    .bg(rgb(if is_selected {
+                        palette.accent
+                    } else {
+                        palette.control
+                    }))
+                    .text_color(rgb(if is_selected {
+                        palette.accent_foreground
+                    } else {
+                        palette.muted
+                    }))
+                    .hover(|style| style.bg(rgb(palette.hover)))
+                    .selected(is_selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mods.set_source(source);
+                        this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        this.load_mod_catalog(cx, false);
+                    }))
+                    .child(source.title(locale))
                     .into_any_element()
             })
             .collect();
@@ -2109,6 +2185,8 @@ impl LauncherApp {
                         .on_click(move |_, _, cx| {
                             let _ = sort_owner.update(cx, |this, cx| {
                                 this.mods.set_sort(ModSort::Popular);
+                                this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                this.load_mod_catalog(cx, false);
                                 cx.notify();
                             });
                         }),
@@ -2119,6 +2197,8 @@ impl LauncherApp {
                         .on_click(move |_, _, cx| {
                             let _ = sort_owner_downloads.update(cx, |this, cx| {
                                 this.mods.set_sort(ModSort::Downloads);
+                                this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                this.load_mod_catalog(cx, false);
                                 cx.notify();
                             });
                         }),
@@ -2129,40 +2209,104 @@ impl LauncherApp {
                         .on_click(move |_, _, cx| {
                             let _ = sort_owner_name.update(cx, |this, cx| {
                                 this.mods.set_sort(ModSort::Name);
+                                this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                this.load_mod_catalog(cx, false);
                                 cx.notify();
                             });
                         }),
                 )
             });
 
-        let cards: Vec<_> = self
-            .mods
-            .visible_mods()
-            .into_iter()
-            .map(|sample| self.mod_card(sample, palette, locale, cx))
-            .collect();
-        let cards_content = if cards.is_empty() {
+        let visible_count = self.mods.visible_mods().len();
+        let item_sizes = Rc::new(vec![size(px(1.), px(96.)); visible_count]);
+        let scroll_handle = self.mods_scroll.clone();
+        let errors = self.mods.errors().iter().map(|error| {
+            let message = if error.missing_api_key {
+                locale.text(
+                    "Чтобы включить CurseForge, задай переменную среды CURSEFORGE_API_KEY.",
+                    "Set the CURSEFORGE_API_KEY environment variable to enable CurseForge.",
+                )
+            } else {
+                error.message.as_str()
+            };
+            div()
+                .px_3()
+                .py_2()
+                .rounded(px(8.))
+                .bg(rgb(palette.control))
+                .text_size(px(11.))
+                .text_color(rgb(palette.muted))
+                .child(format!("{}: {message}", error.provider.title(locale)))
+                .into_any_element()
+        });
+
+        let cards_content = if visible_count > 0 {
             div()
                 .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .overflow_hidden()
+                .child(
+                    div().size_full().min_w_0().child(
+                        gpui_kit::base::v_virtual_list(
+                            cx.entity(),
+                            "mods-catalog-virtual-list",
+                            item_sizes,
+                            move |this, visible_range, _, cx| {
+                                let projects = this.mods.visible_mods();
+                                visible_range
+                                    .filter_map(|index| projects.get(index).copied())
+                                    .map(|project| {
+                                        div()
+                                            .v_flex()
+                                            .h(px(96.))
+                                            .w_full()
+                                            .min_w_0()
+                                            .justify_center()
+                                            .child(this.mod_card(project, palette, locale, cx))
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .with_sizing_behavior(ListSizingBehavior::Infer)
+                        .track_scroll(&scroll_handle),
+                    ),
+                )
+                .child(Scrollbar::vertical(&self.mods_scroll))
+                .into_any_element()
+        } else {
+            let message = if self.mods.is_loading() {
+                locale.text("Загружаем каталог модов…", "Loading mod catalog…")
+            } else if self.mods.errors().is_empty() {
+                locale.text("Ничего не найдено", "No mods found")
+            } else {
+                locale.text("Не удалось загрузить моды", "Could not load mods")
+            };
+            div()
+                .flex_1()
+                .min_h_0()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_color(rgb(palette.muted))
-                .child(locale.text(
-                    "В этой категории пока нет модов",
-                    "No mods in this category yet",
-                ))
+                .child(message)
                 .into_any_element()
+        };
+
+        let retry = if !self.mods.errors().is_empty() && !self.mods.is_loading() {
+            Some(
+                UiButton::new("retry-mod-catalog")
+                    .px_3()
+                    .py_2()
+                    .rounded(px(7.))
+                    .bg(rgb(palette.control))
+                    .text_color(rgb(palette.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.load_mod_catalog(cx, false)))
+                    .child(locale.text("Повторить", "Retry")),
+            )
         } else {
-            div()
-                .v_flex()
-                .flex_1()
-                .min_h_0()
-                .pr_4()
-                .overflow_y_scrollbar()
-                .gap_2()
-                .children(cards)
-                .into_any_element()
+            None
         };
 
         div()
@@ -2170,6 +2314,7 @@ impl LauncherApp {
             .w_full()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .gap_4()
             .child(self.search_bar(palette, locale))
             .child(
@@ -2180,12 +2325,20 @@ impl LauncherApp {
                     .justify_between()
                     .child(
                         div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
                             .text_size(px(13.))
                             .text_color(rgb(palette.muted))
-                            .child(locale.text("Примеры модов", "Sample mods")),
+                            .child(locale.text("Каталог модов", "Mod catalog"))
+                            .child(format!("({visible_count})"))
+                            .when(self.mods.is_loading(), |this| {
+                                this.child(IconName::LoaderCircle)
+                            }),
                     )
                     .child(sort_menu),
             )
+            .child(div().h_flex().w_full().gap_2().children(sources))
             .child(
                 div()
                     .h_flex()
@@ -2195,20 +2348,24 @@ impl LauncherApp {
                     .overflow_x_scrollbar()
                     .children(categories),
             )
+            .children(errors)
+            .when_some(retry, |this, button| this.child(button))
             .child(cards_content)
             .into_any_element()
     }
 
     fn mod_card(
         &self,
-        sample: &ModSample,
+        project: &ModProject,
         palette: Palette,
         locale: Locale,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let description = sample.description(locale);
-        let sample_id = sample.id;
-        let tags: Vec<_> = sample
+        let description = project.description.clone();
+        let project_id = project.id.clone();
+        let project_url = project.page_url.clone();
+        let selected_project = project.clone();
+        let tags: Vec<_> = project
             .categories
             .iter()
             .map(|category| {
@@ -2224,29 +2381,32 @@ impl LauncherApp {
             })
             .collect();
 
-        let details_button = UiButton::new(format!("open-mod-{}", sample.id.element_id()))
+        let details_button = UiButton::new(format!("open-mod-{}", project.id))
             .flex_1()
+            .min_w_0()
             .px_3()
             .py_2()
             .rounded(px(8.))
             .text_color(rgb(palette.foreground))
             .accessibility_label(locale.text("Открыть страницу мода", "Open mod details"))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.mods.select_mod(sample_id);
+                this.mods.select_mod(selected_project.clone());
                 this.navigate_to(Page::ModDetails, window, cx);
             }))
             .child(
                 div()
                     .h_flex()
                     .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_3()
-                    .child(mod_thumbnail(sample, px(56.)))
+                    .child(mod_project_thumbnail(project, px(56.)))
                     .child(
                         div()
                             .v_flex()
                             .flex_1()
                             .min_w_0()
+                            .w_full()
                             .gap_1()
                             .items_start()
                             .child(
@@ -2254,24 +2414,32 @@ impl LauncherApp {
                                     .text_size(px(14.))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(palette.foreground))
-                                    .child(sample.name),
+                                    .w_full()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(project.name.clone()),
                             )
                             .child(
                                 div()
-                                    .id(format!("mod-description-{}", sample.id.element_id()))
+                                    .id(format!("mod-description-{}", project.id))
                                     .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
                                     .text_size(px(11.))
                                     .text_color(rgb(palette.muted))
                                     .truncate()
                                     .tooltip(move |window, cx| {
-                                        Tooltip::new(description).build(window, cx)
+                                        Tooltip::new(description.clone()).build(window, cx)
                                     })
-                                    .child(description),
+                                    .child(project.description.clone()),
                             )
                             .child(
                                 div()
                                     .h_flex()
+                                    .w_full()
+                                    .min_w_0()
                                     .items_center()
+                                    .overflow_hidden()
                                     .gap_3()
                                     .text_size(px(10.))
                                     .text_color(rgb(palette.muted))
@@ -2281,7 +2449,7 @@ impl LauncherApp {
                                             .items_center()
                                             .gap_1()
                                             .child(IconName::User)
-                                            .child(sample.author),
+                                            .child(project.author.clone()),
                                     )
                                     .child(
                                         div()
@@ -2289,7 +2457,7 @@ impl LauncherApp {
                                             .items_center()
                                             .gap_1()
                                             .child(IconName::ArrowDown)
-                                            .child(sample.downloads_label),
+                                            .child(project.downloads_label.clone()),
                                     )
                                     .child(
                                         div()
@@ -2297,7 +2465,7 @@ impl LauncherApp {
                                             .items_center()
                                             .gap_1()
                                             .child(IconName::Heart)
-                                            .child(sample.likes_label),
+                                            .child(project.likes_label.clone()),
                                     )
                                     .children(tags),
                             ),
@@ -2307,6 +2475,7 @@ impl LauncherApp {
         div()
             .h_flex()
             .w_full()
+            .min_w_0()
             .items_center()
             .gap_3()
             .rounded(px(10.))
@@ -2317,11 +2486,12 @@ impl LauncherApp {
             .child(details_button)
             .child(
                 div()
-                    .v_flex()
-                    .items_end()
+                    .h_flex()
+                    .w(px(220.))
+                    .items_center()
+                    .justify_end()
                     .gap_2()
                     .pr_3()
-                    .py_2()
                     .child(
                         div()
                             .px_2()
@@ -2330,12 +2500,28 @@ impl LauncherApp {
                             .bg(rgb(palette.control))
                             .text_size(px(10.))
                             .text_color(rgb(palette.muted))
-                            .child(sample.game_version),
+                            .child(project.game_version.clone()),
                     )
                     .child(
-                        ComponentButton::new(format!("install-{}", sample.name))
-                            .primary()
-                            .label(locale.text("Установить", "Install")),
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .bg(rgb(palette.control))
+                            .text_size(px(9.))
+                            .text_color(rgb(palette.muted))
+                            .child(project.source.title(locale)),
+                    )
+                    .child(
+                        UiButton::new(format!("open-source-{project_id}"))
+                            .px_3()
+                            .py_2()
+                            .rounded(px(7.))
+                            .bg(rgb(palette.accent))
+                            .text_color(rgb(palette.accent_foreground))
+                            .hover(|style| style.opacity(0.9))
+                            .on_click(move |_, _, cx| cx.open_url(&project_url))
+                            .child(locale.text("Открыть", "Open")),
                     ),
             )
             .into_any_element()
@@ -2346,6 +2532,7 @@ impl LauncherApp {
             return self.empty_page(palette, locale);
         };
         let active_tab = self.mods.detail_tab();
+        let project_url = sample.page_url.clone();
 
         let back_button = UiButton::new("mod-details-back")
             .px_2()
@@ -2387,6 +2574,7 @@ impl LauncherApp {
         let hero = div()
             .h_flex()
             .w_full()
+            .min_w_0()
             .items_center()
             .gap_4()
             .p_4()
@@ -2394,7 +2582,7 @@ impl LauncherApp {
             .bg(rgb(palette.surface))
             .border_1()
             .border_color(rgb(palette.border))
-            .child(mod_thumbnail(sample, px(76.)))
+            .child(mod_project_thumbnail(sample, px(76.)))
             .child(
                 div()
                     .v_flex()
@@ -2406,23 +2594,29 @@ impl LauncherApp {
                             .text_size(px(21.))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(palette.foreground))
-                            .child(sample.name),
+                            .w_full()
+                            .min_w_0()
+                            .truncate()
+                            .child(sample.name.clone()),
                     )
                     .child(
                         div()
                             .h_flex()
+                            .w_full()
+                            .min_w_0()
                             .items_center()
+                            .overflow_hidden()
                             .gap_3()
                             .text_size(px(11.))
                             .text_color(rgb(palette.muted))
-                            .child(sample.author)
+                            .child(sample.author.clone())
                             .child(
                                 div()
                                     .h_flex()
                                     .items_center()
                                     .gap_1()
                                     .child(IconName::ArrowDown)
-                                    .child(sample.downloads_label),
+                                    .child(sample.downloads_label.clone()),
                             )
                             .child(
                                 div()
@@ -2430,14 +2624,23 @@ impl LauncherApp {
                                     .items_center()
                                     .gap_1()
                                     .child(IconName::Heart)
-                                    .child(sample.likes_label),
+                                    .child(sample.likes_label.clone()),
                             ),
                     )
-                    .child(div().h_flex().gap_2().children(category_tags)),
+                    .child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap_2()
+                            .children(category_tags),
+                    ),
             )
             .child(
                 div()
                     .v_flex()
+                    .w(px(190.))
                     .items_end()
                     .gap_2()
                     .child(
@@ -2448,18 +2651,21 @@ impl LauncherApp {
                             .bg(rgb(palette.control))
                             .text_size(px(10.))
                             .text_color(rgb(palette.muted))
-                            .child(sample.game_version),
+                            .child(sample.game_version.clone()),
                     )
                     .child(
-                        UiButton::new(format!("details-install-{}", sample.id.element_id()))
+                        UiButton::new(format!("details-install-{}", sample.id))
                             .px_3()
                             .py_2()
                             .rounded(px(7.))
                             .bg(rgb(palette.accent))
                             .text_color(rgb(palette.accent_foreground))
                             .hover(|style| style.opacity(0.9))
-                            .accessibility_label(locale.text("Установить мод", "Install mod"))
-                            .child(locale.text("Установить", "Install")),
+                            .accessibility_label(
+                                locale.text("Открыть страницу проекта", "Open project page"),
+                            )
+                            .on_click(move |_, _, cx| cx.open_url(&project_url))
+                            .child(locale.text("Открыть проект", "Open project")),
                     ),
             );
 
@@ -2468,7 +2674,11 @@ impl LauncherApp {
             .map(|tab| {
                 let is_selected = tab == active_tab;
                 let title = if tab == ModDetailTab::Files {
-                    format!("{} ({})", tab.title(locale), sample.files_count)
+                    if sample.files_count > 0 {
+                        format!("{} ({})", tab.title(locale), sample.files_count)
+                    } else {
+                        tab.title(locale).to_owned()
+                    }
                 } else {
                     tab.title(locale).to_owned()
                 };
@@ -2502,6 +2712,7 @@ impl LauncherApp {
         let metadata = div()
             .v_flex()
             .w(px(204.))
+            .min_w_0()
             .gap_3()
             .p_4()
             .rounded(px(10.))
@@ -2511,31 +2722,31 @@ impl LauncherApp {
             .child(detail_meta_row(
                 IconName::Calendar,
                 locale.text("Последнее обновление", "Last updated"),
-                sample.updated,
+                sample.updated.clone(),
                 palette,
             ))
             .child(detail_meta_row(
                 IconName::HardDrive,
                 locale.text("Размер", "File size"),
-                sample.file_size,
+                sample.file_size.clone(),
                 palette,
             ))
             .child(detail_meta_row(
                 IconName::FileText,
                 locale.text("Лицензия", "License"),
-                sample.license,
+                sample.license.clone(),
                 palette,
             ))
             .child(detail_meta_row(
                 IconName::Blocks,
                 locale.text("Игровые версии", "Game versions"),
-                sample.game_version,
+                sample.game_version.clone(),
                 palette,
             ))
             .child(detail_meta_row(
                 IconName::Cpu,
                 locale.text("Загрузчики", "Loaders"),
-                sample.loaders,
+                sample.loaders.clone(),
                 palette,
             ));
 
@@ -2544,6 +2755,7 @@ impl LauncherApp {
             .w_full()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .gap_3()
             .child(back_button)
             .child(hero)
@@ -2554,12 +2766,14 @@ impl LauncherApp {
                     .w_full()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .gap_3()
                     .child(
                         div()
                             .v_flex()
                             .flex_1()
                             .min_h_0()
+                            .min_w_0()
                             .pr_4()
                             .overflow_y_scrollbar()
                             .child(tab_content),
@@ -2571,7 +2785,7 @@ impl LauncherApp {
 
     fn mod_detail_content(
         &self,
-        sample: &ModSample,
+        sample: &ModProject,
         tab: ModDetailTab,
         palette: Palette,
         locale: Locale,
@@ -2579,10 +2793,14 @@ impl LauncherApp {
         match tab {
             ModDetailTab::Description => div()
                 .v_flex()
+                .w_full()
+                .min_w_0()
                 .gap_4()
                 .child(
                     div()
                         .v_flex()
+                        .w_full()
+                        .min_w_0()
                         .gap_2()
                         .p_4()
                         .rounded(px(10.))
@@ -2598,81 +2816,55 @@ impl LauncherApp {
                         )
                         .child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .text_size(px(12.))
                                 .text_color(rgb(palette.muted))
-                                .child(sample.description(locale)),
+                                .child(sample.description.clone()),
                         ),
                 )
                 .child(self.mod_screenshots(sample, palette, locale))
                 .into_any_element(),
-            ModDetailTab::Files => {
-                let files: Vec<_> = sample
-                    .loaders
-                    .split(", ")
-                    .enumerate()
-                    .map(|(index, loader)| {
-                        div()
-                            .h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_3()
-                            .p_3()
-                            .rounded(px(8.))
-                            .bg(rgb(palette.surface))
-                            .border_1()
-                            .border_color(rgb(palette.border))
-                            .child(IconName::File)
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(rgb(palette.foreground))
-                                            .child(format!(
-                                                "{}-{}-{}.jar",
-                                                sample.id.element_id(),
-                                                sample.game_version,
-                                                loader.to_lowercase()
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(palette.muted))
-                                            .child(format!(
-                                                "{} · {} · {}",
-                                                loader, sample.updated, sample.file_size
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(palette.muted))
-                                    .child(format!("v{}", index + 1)),
-                            )
-                            .into_any_element()
-                    })
-                    .collect();
-
-                div().v_flex().gap_2().children(files).into_any_element()
-            }
+            ModDetailTab::Files => div()
+                .v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(palette.muted))
+                        .child(locale.text(
+                            "Файлы и версии доступны на странице проекта.",
+                            "Files and versions are available on the project page.",
+                        )),
+                )
+                .child(
+                    UiButton::new("open-mod-project-files")
+                        .px_3()
+                        .py_2()
+                        .rounded(px(7.))
+                        .bg(rgb(palette.control))
+                        .text_color(rgb(palette.foreground))
+                        .hover(|style| style.bg(rgb(palette.hover)))
+                        .on_click({
+                            let project_url = sample.page_url.clone();
+                            move |_, _, cx| cx.open_url(&project_url)
+                        })
+                        .child(locale.text("Открыть страницу проекта", "Open project page")),
+                )
+                .into_any_element(),
             ModDetailTab::Dependencies => div()
                 .v_flex()
                 .gap_3()
                 .child(detail_meta_row(
                     IconName::Blocks,
                     locale.text("Игра", "Game"),
-                    sample.game_version,
+                    sample.game_version.clone(),
                     palette,
                 ))
                 .child(detail_meta_row(
                     IconName::Cpu,
                     locale.text("Поддерживаемые загрузчики", "Supported loaders"),
-                    sample.loaders,
+                    sample.loaders.clone(),
                     palette,
                 ))
                 .into_any_element(),
@@ -2680,7 +2872,6 @@ impl LauncherApp {
             ModDetailTab::Similar => {
                 let similar: Vec<_> = SAMPLE_MODS
                     .iter()
-                    .filter(|candidate| candidate.id != sample.id)
                     .take(3)
                     .map(|candidate| self.home_mod_card(candidate, palette, locale))
                     .collect();
@@ -2694,12 +2885,12 @@ impl LauncherApp {
         }
     }
 
-    fn mod_screenshots(&self, sample: &ModSample, palette: Palette, locale: Locale) -> AnyElement {
+    fn mod_screenshots(&self, sample: &ModProject, palette: Palette, locale: Locale) -> AnyElement {
         let thumbnails: Vec<_> = [0, 1, 2]
             .into_iter()
             .map(|index| {
                 if index == 0 && sample.image_url.is_some() {
-                    mod_thumbnail(sample, px(112.))
+                    mod_project_thumbnail(sample, px(112.))
                 } else {
                     div()
                         .flex_1()
@@ -3427,6 +3618,7 @@ impl Render for LauncherApp {
                     .v_flex()
                     .flex_1()
                     .h_full()
+                    .min_w_0()
                     .p_8()
                     .gap_6()
                     .child(page_header)
@@ -3436,11 +3628,33 @@ impl Render for LauncherApp {
 }
 
 fn mod_thumbnail(sample: &ModSample, size: Pixels) -> AnyElement {
-    let icon = sample.icon;
-    let background = sample.icon_background;
-    let foreground = sample.icon_foreground;
+    mod_thumbnail_data(
+        sample.icon,
+        sample.icon_background,
+        sample.icon_foreground,
+        sample.image_url,
+        size,
+    )
+}
 
-    if let Some(url) = sample.image_url {
+fn mod_project_thumbnail(project: &ModProject, size: Pixels) -> AnyElement {
+    mod_thumbnail_data(
+        project.icon,
+        project.icon_background,
+        project.icon_foreground,
+        project.image_url.as_deref(),
+        size,
+    )
+}
+
+fn mod_thumbnail_data(
+    icon: IconName,
+    background: u32,
+    foreground: u32,
+    image_url: Option<&str>,
+    size: Pixels,
+) -> AnyElement {
+    if let Some(url) = image_url {
         div()
             .w(size)
             .h(size)
@@ -3523,11 +3737,13 @@ fn mod_icon_placeholder(
 fn detail_meta_row(
     icon: IconName,
     label: &'static str,
-    value: &'static str,
+    value: impl Into<String>,
     palette: Palette,
 ) -> AnyElement {
     div()
         .h_flex()
+        .w_full()
+        .min_w_0()
         .items_start()
         .gap_2()
         .text_color(rgb(palette.muted))
@@ -3536,13 +3752,17 @@ fn detail_meta_row(
             div()
                 .v_flex()
                 .flex_1()
+                .min_w_0()
+                .w_full()
                 .gap_1()
                 .child(div().text_size(px(10.)).child(label))
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .text_size(px(11.))
                         .text_color(rgb(palette.foreground))
-                        .child(value),
+                        .child(value.into()),
                 ),
         )
         .into_any_element()
