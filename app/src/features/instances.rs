@@ -530,6 +530,7 @@ pub fn launch_profile(
     for (key, value) in &command.env {
         process.env(key, value);
     }
+    crate::platform::process::hide_console_window(&mut process);
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -644,10 +645,10 @@ fn read_output_tail(mut stream: impl Read) -> String {
 }
 
 fn java_major_version(java_executable: &Path) -> Option<u32> {
-    let output = Command::new(java_executable)
-        .arg("-version")
-        .output()
-        .ok()?;
+    let mut command = Command::new(java_executable);
+    command.arg("-version");
+    crate::platform::process::hide_console_window(&mut command);
+    let output = command.output().ok()?;
     let version = [
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
