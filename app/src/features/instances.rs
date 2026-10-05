@@ -62,6 +62,15 @@ pub enum InstanceRuntime {
         total: Option<u64>,
         completed_tasks: usize,
     },
+    DownloadingMod {
+        name: String,
+    },
+    ModDownloadFailed {
+        message: String,
+    },
+    ModDownloaded {
+        filename: String,
+    },
     Ready,
     Launching,
     Running {
@@ -141,6 +150,21 @@ impl InstancesState {
                 completed_tasks: 0,
             },
         );
+    }
+
+    pub fn mark_mod_downloading(&mut self, id: Uuid, name: String) {
+        self.runtime
+            .insert(id, InstanceRuntime::DownloadingMod { name });
+    }
+
+    pub fn mark_mod_downloaded(&mut self, id: Uuid, filename: String) {
+        self.runtime
+            .insert(id, InstanceRuntime::ModDownloaded { filename });
+    }
+
+    pub fn mark_mod_download_failed(&mut self, id: Uuid, message: String) {
+        self.runtime
+            .insert(id, InstanceRuntime::ModDownloadFailed { message });
     }
 
     pub fn update_progress(

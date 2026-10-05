@@ -5,8 +5,12 @@ use crate::{
         launch_profile, remove_profile_data,
     },
     features::mods::{
-        ModCategory, ModDetailTab, ModSample, ModSort, ModsState, SAMPLE_MODS,
-        catalog::{ModProject, ModSource, search_catalog},
+        ModCategory, ModCompatibilityFilter, ModDetailTab, ModLoaderFilter, ModSample, ModSort,
+        ModsState, SAMPLE_MODS,
+        catalog::{
+            ModProject, ModSource, fetch_project_description, install_compatible_mod,
+            search_catalog,
+        },
     },
     features::settings::{AccentColor, Locale, SettingsState, ThemeChoice},
     features::versions::{
@@ -326,7 +330,7 @@ impl LauncherApp {
     }
 
     fn load_mod_catalog(&mut self, cx: &mut Context<Self>, debounce: bool) {
-        let (request_id, query, sort, source) = self.mods.begin_search();
+        let (request_id, query, sort, source, compatibility_filter) = self.mods.begin_search();
         let client = cx.http_client();
         let curseforge_api_key = std::env::var("CURSEFORGE_API_KEY").ok();
         cx.notify();
@@ -344,12 +348,260 @@ impl LauncherApp {
                 }
             }
 
-            let result = search_catalog(client, query, sort, source, curseforge_api_key).await;
+            let result = search_catalog(
+                client,
+                query,
+                sort,
+                source,
+                curseforge_api_key,
+                compatibility_filter,
+            )
+            .await;
             let _ = this.update(cx, |this, cx| {
                 if this.mods.finish_search(request_id, result) {
                     this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
                     cx.notify();
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn load_mod_description(
+        &self,
+        project_id: String,
+        source: ModSource,
+        request_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let client = cx.http_client();
+        let curseforge_api_key = std::env::var("CURSEFORGE_API_KEY").ok();
+        cx.spawn(async move |this, cx| {
+            let result =
+                fetch_project_description(client, project_id, source, curseforge_api_key).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mods.finish_description_load(request_id, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_mod_download_dialog(
+        &mut self,
+        project: ModProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let locale = self.settings.locale();
+        let palette = Palette::for_settings(self.settings.theme(), self.settings.accent());
+        let profiles = self
+            .instances
+            .profiles()
+            .iter()
+            .map(|profile| {
+                let runtime = self.instances.runtime(&profile.id);
+                let busy = matches!(
+                    runtime,
+                    InstanceRuntime::Installing { .. }
+                        | InstanceRuntime::DownloadingMod { .. }
+                        | InstanceRuntime::Launching
+                        | InstanceRuntime::Running { .. }
+                        | InstanceRuntime::Removing
+                );
+                (profile.clone(), busy)
+            })
+            .collect::<Vec<_>>();
+        let owner = cx.entity().downgrade();
+        let title = format!(
+            "{} · {}",
+            locale.text("Скачать мод", "Download mod"),
+            project.name
+        );
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            let content_owner = owner.clone();
+            let project = project.clone();
+            let content_profiles = profiles.clone();
+            dialog
+                .w(px(500.))
+                .title(title.clone())
+                .content(move |content, _, _| {
+                    if content_profiles.is_empty() {
+                        let create_owner = content_owner.clone();
+                        return content.child(
+                            div()
+                                .v_flex()
+                                .w_full()
+                                .gap_3()
+                                .p_4()
+                                .text_color(rgb(palette.foreground))
+                                .child(locale.text(
+                                    "Сначала создай сборку, куда установить мод.",
+                                    "Create a build first, then choose it as the mod destination.",
+                                ))
+                                .child(
+                                    UiButton::new("mod-download-create-build")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded(px(8.))
+                                        .bg(rgb(palette.accent))
+                                        .text_color(rgb(palette.accent_foreground))
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            if let Some(owner) = create_owner.upgrade() {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    this.navigate_to(Page::Instances, window, cx);
+                                                });
+                                            }
+                                        })
+                                        .child(locale.text("Открыть сборки", "Open builds")),
+                                ),
+                        );
+                    }
+
+                    let rows = content_profiles
+                        .iter()
+                        .map(|(profile, busy)| {
+                            let profile_id = profile.id;
+                            let has_mod_loader = profile.loader != LoaderChoice::Vanilla;
+                            let profile_details = if !has_mod_loader {
+                                locale
+                                    .text(
+                                        "Для модов нужна сборка с Fabric, Forge или NeoForge",
+                                        "Mods need a Fabric, Forge, or NeoForge build",
+                                    )
+                                    .to_owned()
+                            } else if *busy {
+                                locale
+                                    .text("Сборка занята другой операцией", "This build is busy")
+                                    .to_owned()
+                            } else {
+                                format!(
+                                    "Minecraft {} · {}",
+                                    profile.game_version,
+                                    loader_title(profile.loader)
+                                )
+                            };
+                            let select_owner = content_owner.clone();
+                            let selected_project = project.clone();
+                            UiButton::new(format!("download-mod-to-{profile_id}"))
+                                .w_full()
+                                .px_3()
+                                .py_3()
+                                .rounded(px(8.))
+                                .bg(rgb(palette.control))
+                                .text_color(rgb(palette.foreground))
+                                .hover(|style| style.bg(rgb(palette.hover)))
+                                .disabled(*busy || !has_mod_loader)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    if let Some(owner) = select_owner.upgrade() {
+                                        let _ = owner.update(cx, |this, cx| {
+                                            this.start_mod_download(
+                                                selected_project.clone(),
+                                                profile_id,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .v_flex()
+                                        .w_full()
+                                        .items_start()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(profile.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(rgb(palette.muted))
+                                                .child(profile_details),
+                                        ),
+                                )
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>();
+
+                    content.child(
+                        div()
+                            .v_flex()
+                            .w_full()
+                            .max_h(px(460.))
+                            .gap_2()
+                            .overflow_y_scrollbar()
+                            .p_4()
+                            .children(rows),
+                    )
+                })
+        });
+    }
+
+    fn start_mod_download(
+        &mut self,
+        project: ModProject,
+        profile_id: uuid::Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.instances.profile(profile_id).cloned() else {
+            return;
+        };
+        let runtime = self.instances.runtime(&profile_id);
+        if matches!(
+            runtime,
+            InstanceRuntime::Installing { .. }
+                | InstanceRuntime::DownloadingMod { .. }
+                | InstanceRuntime::Launching
+                | InstanceRuntime::Running { .. }
+                | InstanceRuntime::Removing
+        ) {
+            return;
+        }
+
+        let compatibility = ModCompatibilityFilter {
+            game_version: profile.game_version.clone(),
+            loader: mod_loader_filter(profile.loader),
+        };
+        let mods_directory =
+            profile_store::instance_directory(&profile.installation_root, profile_id).join("mods");
+        self.instances
+            .mark_mod_downloading(profile_id, project.name.clone());
+        let client = cx.http_client();
+        let curseforge_api_key = std::env::var("CURSEFORGE_API_KEY").ok();
+        let project_id = project.id;
+        let source = project.source;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = install_compatible_mod(
+                client,
+                project_id,
+                source,
+                compatibility,
+                curseforge_api_key,
+                mods_directory,
+            )
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(filename) => {
+                        tracing::info!(profile_id = %profile_id, %filename, "installed mod into profile");
+                        this.instances
+                            .mark_mod_downloaded(profile_id, filename);
+                    }
+                    Err(error) => {
+                        this.instances
+                            .mark_mod_download_failed(profile_id, error.message);
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -785,6 +1037,7 @@ impl LauncherApp {
                                                         if matches!(
                                                             runtime,
                                                             InstanceRuntime::Installing { .. }
+                                                                | InstanceRuntime::DownloadingMod { .. }
                                                                 | InstanceRuntime::Launching
                                                                 | InstanceRuntime::Running { .. }
                                                                 | InstanceRuntime::Removing
@@ -1661,6 +1914,80 @@ impl LauncherApp {
             .into_any_element()
     }
 
+    fn instances_page(&self, palette: Palette, locale: Locale, cx: &Context<Self>) -> AnyElement {
+        let profiles = self
+            .instances
+            .profiles()
+            .iter()
+            .map(|profile| self.instance_card(profile, palette, locale, cx))
+            .collect::<Vec<_>>();
+
+        div()
+            .v_flex()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_y_scrollbar()
+            .gap_4()
+            .child(
+                div()
+                    .h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(palette.muted))
+                            .child(locale.text(
+                                "Управляй версиями Minecraft и добавляй в них моды.",
+                                "Manage Minecraft builds and add compatible mods to them.",
+                            )),
+                    )
+                    .child(
+                        UiButton::new("instances-create-build")
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(rgb(palette.accent))
+                            .text_color(rgb(palette.accent_foreground))
+                            .hover(|style| style.opacity(0.9))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_version_picker(window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(IconName::Plus)
+                                    .child(locale.text("Создать сборку", "Create build")),
+                            ),
+                    ),
+            )
+            .when(profiles.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .p_6()
+                        .rounded(px(10.))
+                        .bg(rgb(palette.surface))
+                        .border_1()
+                        .border_color(rgb(palette.border))
+                        .text_size(px(12.))
+                        .text_color(rgb(palette.muted))
+                        .child(locale.text(
+                            "Сборок пока нет. Создай первую сборку, чтобы установить игру и моды.",
+                            "No builds yet. Create one to install Minecraft and add mods.",
+                        )),
+                )
+            })
+            .children(profiles)
+            .into_any_element()
+    }
+
     fn instances_section(
         &self,
         palette: Palette,
@@ -1703,6 +2030,7 @@ impl LauncherApp {
         let is_busy = matches!(
             &runtime,
             InstanceRuntime::Installing { .. }
+                | InstanceRuntime::DownloadingMod { .. }
                 | InstanceRuntime::Launching
                 | InstanceRuntime::Running { .. }
                 | InstanceRuntime::Removing
@@ -1746,6 +2074,35 @@ impl LauncherApp {
                     locale.text("Скачивание…", "Downloading…"),
                 )
             }
+            InstanceRuntime::DownloadingMod { name } => (
+                locale.text("Скачивание мода", "Downloading mod").to_owned(),
+                name.clone(),
+                locale.text("Скачивание…", "Downloading…"),
+            ),
+            InstanceRuntime::ModDownloadFailed { message } => (
+                locale
+                    .text("Не удалось скачать мод", "Mod download failed")
+                    .to_owned(),
+                message.clone(),
+                if is_installed {
+                    locale.text("Играть", "Play")
+                } else {
+                    locale.text("Установить", "Install")
+                },
+            ),
+            InstanceRuntime::ModDownloaded { filename } => (
+                locale.text("Мод скачан", "Mod downloaded").to_owned(),
+                format!(
+                    "{}{}",
+                    locale.text("Файл добавлен: ", "File added: "),
+                    filename
+                ),
+                if is_installed {
+                    locale.text("Играть", "Play")
+                } else {
+                    locale.text("Установить игру", "Install game")
+                },
+            ),
             InstanceRuntime::Ready => (
                 locale.text("Готова к запуску", "Ready to play").to_string(),
                 locale
@@ -1822,6 +2179,10 @@ impl LauncherApp {
             )
         };
         let profile_id = profile.id;
+        let mod_filter = ModCompatibilityFilter {
+            game_version: profile.game_version.clone(),
+            loader: mod_loader_filter(profile.loader),
+        };
 
         div()
             .v_flex()
@@ -1885,6 +2246,28 @@ impl LauncherApp {
                     .items_center()
                     .justify_end()
                     .gap_2()
+                    .child(
+                        UiButton::new(format!("add-mods-instance-{profile_id}"))
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(rgb(palette.control))
+                            .text_color(rgb(palette.foreground))
+                            .hover(|style| style.bg(rgb(palette.hover)))
+                            .disabled(is_busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.mods.set_compatibility_filter(mod_filter.clone());
+                                this.navigate_to(Page::Mods, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(IconName::Puzzle)
+                                    .child(locale.text("Добавить моды", "Add mods")),
+                            ),
+                    )
                     .child(
                         UiButton::new(format!("play-instance-{profile_id}"))
                             .px_4()
@@ -2101,6 +2484,27 @@ impl LauncherApp {
         let selected_category = self.mods.category();
         let selected_sort = self.mods.sort();
         let selected_source = self.mods.source();
+        let target_filter_chip = self.mods.compatibility_filter().map(|filter| {
+            let label = format!(
+                "{} · Minecraft {} · {} ×",
+                locale.text("Сборка", "Build"),
+                filter.game_version,
+                filter.loader.title(locale)
+            );
+            UiButton::new("clear-mod-compatibility-filter")
+                .px_3()
+                .py_2()
+                .rounded(px(8.))
+                .bg(rgb(palette.selected))
+                .text_color(rgb(palette.accent))
+                .hover(|style| style.bg(rgb(palette.hover)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.mods.clear_compatibility_filter();
+                    this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    this.load_mod_catalog(cx, false);
+                }))
+                .child(label)
+        });
         let categories: Vec<_> = ModCategory::ALL
             .into_iter()
             .map(|category| {
@@ -2317,6 +2721,7 @@ impl LauncherApp {
             .min_w_0()
             .gap_4()
             .child(self.search_bar(palette, locale))
+            .when_some(target_filter_chip, |this, chip| this.child(chip))
             .child(
                 div()
                     .h_flex()
@@ -2363,7 +2768,7 @@ impl LauncherApp {
     ) -> AnyElement {
         let description = project.description.clone();
         let project_id = project.id.clone();
-        let project_url = project.page_url.clone();
+        let download_project = project.clone();
         let selected_project = project.clone();
         let tags: Vec<_> = project
             .categories
@@ -2390,7 +2795,13 @@ impl LauncherApp {
             .text_color(rgb(palette.foreground))
             .accessibility_label(locale.text("Открыть страницу мода", "Open mod details"))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.mods.select_mod(selected_project.clone());
+                let request_id = this.mods.select_mod(selected_project.clone());
+                this.load_mod_description(
+                    selected_project.id.clone(),
+                    selected_project.source,
+                    request_id,
+                    cx,
+                );
                 this.navigate_to(Page::ModDetails, window, cx);
             }))
             .child(
@@ -2513,15 +2924,17 @@ impl LauncherApp {
                             .child(project.source.title(locale)),
                     )
                     .child(
-                        UiButton::new(format!("open-source-{project_id}"))
+                        UiButton::new(format!("download-mod-{project_id}"))
                             .px_3()
                             .py_2()
                             .rounded(px(7.))
                             .bg(rgb(palette.accent))
                             .text_color(rgb(palette.accent_foreground))
                             .hover(|style| style.opacity(0.9))
-                            .on_click(move |_, _, cx| cx.open_url(&project_url))
-                            .child(locale.text("Открыть", "Open")),
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_mod_download_dialog(download_project.clone(), window, cx);
+                            }))
+                            .child(locale.text("Скачать", "Download")),
                     ),
             )
             .into_any_element()
@@ -2533,6 +2946,7 @@ impl LauncherApp {
         };
         let active_tab = self.mods.detail_tab();
         let project_url = sample.page_url.clone();
+        let download_project = sample.clone();
 
         let back_button = UiButton::new("mod-details-back")
             .px_2()
@@ -2654,18 +3068,29 @@ impl LauncherApp {
                             .child(sample.game_version.clone()),
                     )
                     .child(
-                        UiButton::new(format!("details-install-{}", sample.id))
+                        UiButton::new(format!("details-download-{}", sample.id))
                             .px_3()
                             .py_2()
                             .rounded(px(7.))
                             .bg(rgb(palette.accent))
                             .text_color(rgb(palette.accent_foreground))
                             .hover(|style| style.opacity(0.9))
-                            .accessibility_label(
-                                locale.text("Открыть страницу проекта", "Open project page"),
-                            )
+                            .accessibility_label(locale.text("Скачать мод", "Download mod"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_mod_download_dialog(download_project.clone(), window, cx);
+                            }))
+                            .child(locale.text("Скачать", "Download")),
+                    )
+                    .child(
+                        UiButton::new(format!("open-mod-page-{}", sample.id))
+                            .px_3()
+                            .py_2()
+                            .rounded(px(7.))
+                            .bg(rgb(palette.control))
+                            .text_color(rgb(palette.foreground))
+                            .hover(|style| style.bg(rgb(palette.hover)))
                             .on_click(move |_, _, cx| cx.open_url(&project_url))
-                            .child(locale.text("Открыть проект", "Open project")),
+                            .child(locale.text("Страница проекта", "Project page")),
                     ),
             );
 
@@ -2708,7 +3133,7 @@ impl LauncherApp {
             })
             .collect();
 
-        let tab_content = self.mod_detail_content(sample, active_tab, palette, locale);
+        let tab_content = self.mod_detail_content(sample, active_tab, palette, locale, cx);
         let metadata = div()
             .v_flex()
             .w(px(204.))
@@ -2768,6 +3193,7 @@ impl LauncherApp {
                     .min_h_0()
                     .min_w_0()
                     .gap_3()
+                    .items_start()
                     .child(
                         div()
                             .v_flex()
@@ -2789,42 +3215,102 @@ impl LauncherApp {
         tab: ModDetailTab,
         palette: Palette,
         locale: Locale,
+        cx: &Context<Self>,
     ) -> AnyElement {
         match tab {
-            ModDetailTab::Description => div()
-                .v_flex()
+            ModDetailTab::Description => {
+                let description = self
+                    .mods
+                    .full_description()
+                    .unwrap_or(&sample.description)
+                    .to_owned();
+                let description_view = match sample.source {
+                    ModSource::CurseForge => gpui_kit::component::text::html(description),
+                    ModSource::All | ModSource::Modrinth => {
+                        gpui_kit::component::text::markdown(description)
+                    }
+                }
                 .w_full()
-                .min_w_0()
-                .gap_4()
-                .child(
-                    div()
-                        .v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .p_4()
-                        .rounded(px(10.))
-                        .bg(rgb(palette.surface))
-                        .border_1()
-                        .border_color(rgb(palette.border))
-                        .child(
+                .text_size(px(12.))
+                .text_color(rgb(palette.muted))
+                .style(
+                    gpui_kit::component::text::TextViewStyle::default()
+                        .paragraph_gap(rems(0.5))
+                        .heading_font_size(|level, _| {
+                            px(match level {
+                                1 => 22.,
+                                2 => 19.,
+                                3 => 16.,
+                                _ => 14.,
+                            })
+                        }),
+                );
+                let description_status =
+                    if self.mods.description_loading() {
+                        Some(
                             div()
-                                .text_size(px(15.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(palette.foreground))
-                                .child(locale.text("Описание", "Description")),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .text_size(px(12.))
+                                .text_size(px(11.))
                                 .text_color(rgb(palette.muted))
-                                .child(sample.description.clone()),
-                        ),
-                )
-                .child(self.mod_screenshots(sample, palette, locale))
-                .into_any_element(),
+                                .child(locale.text(
+                                    "Загружаем полное описание…",
+                                    "Loading full description…",
+                                ))
+                                .into_any_element(),
+                        )
+                    } else {
+                        self.mods.description_error().map(|error| {
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(palette.muted))
+                                .child(format!(
+                                    "{}{error}",
+                                    locale.text(
+                                        "Полное описание недоступно: ",
+                                        "Full description unavailable: "
+                                    )
+                                ))
+                                .into_any_element()
+                        })
+                    };
+
+                div()
+                    .v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_4()
+                    .child(
+                        div()
+                            .v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .p_4()
+                            .rounded(px(10.))
+                            .bg(rgb(palette.surface))
+                            .border_1()
+                            .border_color(rgb(palette.border))
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(palette.foreground))
+                                    .child(locale.text("Описание", "Description")),
+                            )
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(description_view)
+                                    .when_some(description_status, |this, status| {
+                                        this.child(status)
+                                    }),
+                            ),
+                    )
+                    .child(self.mod_screenshots(sample, palette, locale))
+                    .into_any_element()
+            }
             ModDetailTab::Files => div()
                 .v_flex()
                 .gap_3()
@@ -2833,23 +3319,25 @@ impl LauncherApp {
                         .text_size(px(12.))
                         .text_color(rgb(palette.muted))
                         .child(locale.text(
-                            "Файлы и версии доступны на странице проекта.",
-                            "Files and versions are available on the project page.",
+                            "Выбери сборку — лаунчер скачает совместимую версию мода.",
+                            "Choose a build and the launcher will download a compatible mod file.",
                         )),
                 )
                 .child(
-                    UiButton::new("open-mod-project-files")
+                    UiButton::new(format!("download-mod-file-{}", sample.id))
                         .px_3()
                         .py_2()
                         .rounded(px(7.))
-                        .bg(rgb(palette.control))
-                        .text_color(rgb(palette.foreground))
-                        .hover(|style| style.bg(rgb(palette.hover)))
-                        .on_click({
-                            let project_url = sample.page_url.clone();
-                            move |_, _, cx| cx.open_url(&project_url)
-                        })
-                        .child(locale.text("Открыть страницу проекта", "Open project page")),
+                        .bg(rgb(palette.accent))
+                        .text_color(rgb(palette.accent_foreground))
+                        .hover(|style| style.opacity(0.9))
+                        .on_click(cx.listener({
+                            let project = sample.clone();
+                            move |this, _, window, cx| {
+                                this.open_mod_download_dialog(project.clone(), window, cx);
+                            }
+                        }))
+                        .child(locale.text("Скачать в сборку", "Download to a build")),
                 )
                 .into_any_element(),
             ModDetailTab::Dependencies => div()
@@ -3543,6 +4031,7 @@ impl Render for LauncherApp {
         .children(navigation_items);
         let page_body = match active_page {
             Page::Home => self.home_page(palette, locale, cx),
+            Page::Instances => self.instances_page(palette, locale, cx),
             Page::Mods => self.mods_page(palette, locale, cx),
             Page::Modpacks | Page::ResourcePacks | Page::Shaders => {
                 self.search_empty_page(palette, locale)
@@ -3554,6 +4043,10 @@ impl Render for LauncherApp {
             Page::Home => locale.text(
                 "Сборки, моды и ресурспаки для твоей игры",
                 "Modpacks, mods, and resource packs for your game",
+            ),
+            Page::Instances => locale.text(
+                "Версия игры, загрузчик и установленные моды",
+                "Game version, loader, and installed mods",
             ),
             Page::Mods => locale.text(
                 "Найди дополнения для своей сборки",
@@ -3658,13 +4151,14 @@ fn mod_thumbnail_data(
         div()
             .w(size)
             .h(size)
-            .rounded(px(8.))
+            .rounded(px(12.))
             .overflow_hidden()
             .bg(rgb(background))
             .child(
                 img(url)
                     .size_full()
                     .object_fit(ObjectFit::Cover)
+                    .rounded(px(12.))
                     .with_loading(move || mod_icon_placeholder(icon, background, foreground, size))
                     .with_fallback(move || {
                         mod_icon_placeholder(icon, background, foreground, size)
@@ -3703,6 +4197,15 @@ fn loader_title(loader: LoaderChoice) -> &'static str {
     }
 }
 
+fn mod_loader_filter(loader: LoaderChoice) -> ModLoaderFilter {
+    match loader {
+        LoaderChoice::Vanilla => ModLoaderFilter::Vanilla,
+        LoaderChoice::Fabric => ModLoaderFilter::Fabric,
+        LoaderChoice::Forge => ModLoaderFilter::Forge,
+        LoaderChoice::NeoForge => ModLoaderFilter::NeoForge,
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     if bytes >= MIB {
@@ -3726,7 +4229,7 @@ fn mod_icon_placeholder(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(8.))
+        .rounded(px(12.))
         .bg(rgb(background))
         .text_color(rgb(foreground))
         .text_size(px((size.as_f32() * 0.5).max(14.)))

@@ -1,0 +1,41 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, branch, or tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out selected commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build launcher
+        run: cargo build --release --package rs-mc-launcher --target x86_64-pc-windows-msvc
+
+      - name: Record built commit
+        shell: pwsh
+        run: |
+          "Built commit: $(git rev-parse HEAD)" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: rs-mc-launcher-windows
+          path: target/x86_64-pc-windows-msvc/release/rs-mc-launcher.exe
+          if-no-files-found: error

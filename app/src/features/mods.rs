@@ -113,6 +113,49 @@ impl ModSort {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModLoaderFilter {
+    Vanilla,
+    Fabric,
+    Forge,
+    NeoForge,
+}
+
+impl ModLoaderFilter {
+    pub fn title(self, locale: Locale) -> &'static str {
+        match self {
+            Self::Vanilla => locale.text("Ваниль", "Vanilla"),
+            Self::Fabric => "Fabric",
+            Self::Forge => "Forge",
+            Self::NeoForge => "NeoForge",
+        }
+    }
+
+    pub(crate) fn modrinth_slug(self) -> &'static str {
+        match self {
+            Self::Vanilla => "minecraft",
+            Self::Fabric => "fabric",
+            Self::Forge => "forge",
+            Self::NeoForge => "neoforge",
+        }
+    }
+
+    pub(crate) fn curseforge_id(self) -> u32 {
+        match self {
+            Self::Vanilla => 0,
+            Self::Forge => 1,
+            Self::Fabric => 4,
+            Self::NeoForge => 6,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModCompatibilityFilter {
+    pub game_version: String,
+    pub loader: ModLoaderFilter,
+}
+
 #[derive(Clone, Copy)]
 pub struct ModSample {
     pub name: &'static str,
@@ -202,7 +245,12 @@ pub struct ModsState {
     errors: Vec<catalog::CatalogProviderError>,
     loading: bool,
     request_id: u64,
+    compatibility_filter: Option<ModCompatibilityFilter>,
     selected_mod: Option<catalog::ModProject>,
+    full_description: Option<String>,
+    description_loading: bool,
+    description_error: Option<String>,
+    description_request_id: u64,
     detail_tab: ModDetailTab,
 }
 
@@ -234,6 +282,23 @@ impl ModsState {
         self.sort = sort;
     }
 
+    pub fn compatibility_filter(&self) -> Option<&ModCompatibilityFilter> {
+        self.compatibility_filter.as_ref()
+    }
+
+    pub fn set_compatibility_filter(&mut self, filter: ModCompatibilityFilter) {
+        if self.compatibility_filter.as_ref() != Some(&filter) {
+            self.compatibility_filter = Some(filter);
+            self.invalidate_search();
+        }
+    }
+
+    pub fn clear_compatibility_filter(&mut self) {
+        if self.compatibility_filter.take().is_some() {
+            self.invalidate_search();
+        }
+    }
+
     pub fn set_query(&mut self, query: String) {
         if self.query != query {
             self.query = query;
@@ -241,9 +306,14 @@ impl ModsState {
         }
     }
 
-    pub fn select_mod(&mut self, project: catalog::ModProject) {
+    pub fn select_mod(&mut self, project: catalog::ModProject) -> u64 {
+        self.description_request_id = self.description_request_id.wrapping_add(1);
         self.selected_mod = Some(project);
+        self.full_description = None;
+        self.description_loading = true;
+        self.description_error = None;
         self.detail_tab = ModDetailTab::Description;
+        self.description_request_id
     }
 
     pub fn selected_mod(&self) -> Option<&catalog::ModProject> {
@@ -251,7 +321,48 @@ impl ModsState {
     }
 
     pub fn clear_selected_mod(&mut self) {
+        self.description_request_id = self.description_request_id.wrapping_add(1);
         self.selected_mod = None;
+        self.full_description = None;
+        self.description_loading = false;
+        self.description_error = None;
+    }
+
+    pub fn full_description(&self) -> Option<&str> {
+        self.full_description.as_deref()
+    }
+
+    pub fn description_loading(&self) -> bool {
+        self.description_loading
+    }
+
+    pub fn description_error(&self) -> Option<&str> {
+        self.description_error.as_deref()
+    }
+
+    pub fn finish_description_load(
+        &mut self,
+        request_id: u64,
+        result: Result<String, catalog::CatalogProviderError>,
+    ) -> bool {
+        if self.description_request_id != request_id || self.selected_mod.is_none() {
+            return false;
+        }
+
+        self.description_loading = false;
+        match result {
+            Ok(description) if !description.trim().is_empty() => {
+                self.full_description = Some(description);
+                self.description_error = None;
+            }
+            Ok(_) => {
+                self.description_error = Some("The provider returned an empty description.".into());
+            }
+            Err(error) => {
+                self.description_error = Some(error.message);
+            }
+        }
+        true
     }
 
     pub fn detail_tab(&self) -> ModDetailTab {
@@ -270,11 +381,25 @@ impl ModsState {
         &self.errors
     }
 
-    pub fn begin_search(&mut self) -> (u64, String, ModSort, catalog::ModSource) {
+    pub fn begin_search(
+        &mut self,
+    ) -> (
+        u64,
+        String,
+        ModSort,
+        catalog::ModSource,
+        Option<ModCompatibilityFilter>,
+    ) {
         self.request_id = self.request_id.wrapping_add(1);
         self.loading = true;
         self.errors.clear();
-        (self.request_id, self.query.clone(), self.sort, self.source)
+        (
+            self.request_id,
+            self.query.clone(),
+            self.sort,
+            self.source,
+            self.compatibility_filter.clone(),
+        )
     }
 
     pub fn is_current_request(&self, request_id: u64) -> bool {

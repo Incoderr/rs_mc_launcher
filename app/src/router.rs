@@ -4,6 +4,7 @@ use gpui_kit::assets::IconName;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Home,
+    Instances,
     Modpacks,
     Mods,
     ResourcePacks,
@@ -13,8 +14,9 @@ pub enum Page {
 }
 
 impl Page {
-    pub const LIBRARY: [Self; 5] = [
+    pub const LIBRARY: [Self; 6] = [
         Self::Home,
+        Self::Instances,
         Self::Modpacks,
         Self::Mods,
         Self::ResourcePacks,
@@ -24,6 +26,7 @@ impl Page {
     pub fn title(self, locale: Locale) -> &'static str {
         match self {
             Self::Home => locale.text("Главная", "Home"),
+            Self::Instances => locale.text("Сборки", "Builds"),
             Self::Modpacks => locale.text("Модпаки", "Modpacks"),
             Self::Mods => locale.text("Моды", "Mods"),
             Self::ResourcePacks => locale.text("Ресурспаки", "Resource packs"),
@@ -36,6 +39,7 @@ impl Page {
     pub fn element_id(self) -> &'static str {
         match self {
             Self::Home => "nav-home",
+            Self::Instances => "nav-instances",
             Self::Modpacks => "nav-modpacks",
             Self::Mods => "nav-mods",
             Self::ResourcePacks => "nav-resource-packs",
@@ -48,6 +52,7 @@ impl Page {
     pub fn icon(self) -> IconName {
         match self {
             Self::Home => IconName::House,
+            Self::Instances => IconName::Box,
             Self::Modpacks => IconName::Blocks,
             Self::Mods => IconName::Puzzle,
             Self::ResourcePacks => IconName::Paintbrush,

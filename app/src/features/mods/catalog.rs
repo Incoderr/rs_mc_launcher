@@ -1,14 +1,15 @@
-use std::{sync::Arc, time::Duration};
+use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt, Request};
 use serde::Deserialize;
 
-use super::{ModCategory, ModSort};
+use super::{ModCategory, ModCompatibilityFilter, ModSort};
 use crate::features::settings::Locale;
 use gpui_kit::assets::IconName;
 
 const MODRINTH_SEARCH_URL: &str = "https://api.modrinth.com/v2/search";
 const CURSEFORGE_SEARCH_URL: &str = "https://api.curseforge.com/v1/mods/search";
+const CURSEFORGE_MOD_DESCRIPTION_URL: &str = "https://api.curseforge.com/v1/mods";
 const CURSEFORGE_MINECRAFT_GAME_ID: u32 = 432;
 const CURSEFORGE_MODS_CLASS_ID: u32 = 6;
 
@@ -77,24 +78,114 @@ pub struct ModCatalogResult {
     pub errors: Vec<CatalogProviderError>,
 }
 
+pub async fn fetch_project_description(
+    client: Arc<dyn HttpClient>,
+    project_id: String,
+    source: ModSource,
+    curseforge_api_key: Option<String>,
+) -> Result<String, CatalogProviderError> {
+    let (url, api_key) = match source {
+        ModSource::Modrinth => {
+            let project_id = project_id.strip_prefix("modrinth:").unwrap_or(&project_id);
+            (
+                format!("https://api.modrinth.com/v2/project/{project_id}"),
+                None,
+            )
+        }
+        ModSource::CurseForge => {
+            let Some(api_key) = curseforge_api_key.filter(|key| !key.trim().is_empty()) else {
+                return Err(CatalogProviderError {
+                    provider: source,
+                    message:
+                        "Set the CURSEFORGE_API_KEY environment variable to enable CurseForge."
+                            .into(),
+                    missing_api_key: true,
+                });
+            };
+            let project_id = project_id
+                .strip_prefix("curseforge:")
+                .unwrap_or(&project_id)
+                .parse::<u64>()
+                .map_err(|error| {
+                    provider_error(source, format!("Invalid CurseForge project id: {error}"))
+                })?;
+            (
+                format!("{CURSEFORGE_MOD_DESCRIPTION_URL}/{project_id}/description?stripped=true"),
+                Some(api_key),
+            )
+        }
+        ModSource::All => {
+            return Err(provider_error(
+                source,
+                "A catalog provider is required to load a project description.".into(),
+            ));
+        }
+    };
+
+    let body = request_body(client, &url, api_key.as_deref(), source).await?;
+    match source {
+        ModSource::Modrinth => {
+            let project: ModrinthProjectDescription =
+                serde_json::from_str(&body).map_err(|error| {
+                    provider_error(
+                        source,
+                        format!("Invalid project description response: {error}"),
+                    )
+                })?;
+            Ok(project.body)
+        }
+        ModSource::CurseForge => {
+            let description: CurseForgeDescriptionResponse =
+                serde_json::from_str(&body).map_err(|error| {
+                    provider_error(
+                        source,
+                        format!("Invalid project description response: {error}"),
+                    )
+                })?;
+            Ok(description.data)
+        }
+        ModSource::All => Err(provider_error(
+            source,
+            "A catalog provider is required to load a project description.".into(),
+        )),
+    }
+}
+
 pub async fn search_catalog(
     client: Arc<dyn HttpClient>,
     query: String,
     sort: ModSort,
     source: ModSource,
     curseforge_api_key: Option<String>,
+    compatibility_filter: Option<ModCompatibilityFilter>,
 ) -> ModCatalogResult {
     let (modrinth, curseforge) = match source {
         ModSource::All => {
             futures::join!(
-                search_modrinth(client.clone(), &query, sort),
-                search_curseforge(client, &query, sort, curseforge_api_key),
+                search_modrinth(client.clone(), &query, sort, compatibility_filter.clone()),
+                search_curseforge(
+                    client,
+                    &query,
+                    sort,
+                    curseforge_api_key,
+                    compatibility_filter,
+                ),
             )
         }
-        ModSource::Modrinth => (search_modrinth(client, &query, sort).await, Ok(Vec::new())),
+        ModSource::Modrinth => (
+            search_modrinth(client, &query, sort, compatibility_filter).await,
+            Ok(Vec::new()),
+        ),
         ModSource::CurseForge => (
             Ok(Vec::new()),
-            search_curseforge(client, &query, sort, curseforge_api_key).await,
+            search_curseforge(
+                client,
+                &query,
+                sort,
+                curseforge_api_key,
+                compatibility_filter,
+            )
+            .await,
         ),
     };
 
@@ -120,6 +211,337 @@ pub async fn search_catalog(
     result
 }
 
+pub async fn install_compatible_mod(
+    client: Arc<dyn HttpClient>,
+    project_id: String,
+    source: ModSource,
+    compatibility: ModCompatibilityFilter,
+    curseforge_api_key: Option<String>,
+    mods_directory: PathBuf,
+) -> Result<String, CatalogProviderError> {
+    if compatibility.loader == super::ModLoaderFilter::Vanilla {
+        return Err(provider_error(
+            source,
+            "A mod loader is required. Create a build with Fabric, Forge, or NeoForge first."
+                .into(),
+        ));
+    }
+
+    let file = fetch_compatible_mod_file(
+        client.clone(),
+        &project_id,
+        source,
+        &compatibility,
+        curseforge_api_key,
+    )
+    .await?;
+
+    if file.filename.trim().is_empty()
+        || file.filename == "."
+        || file.filename == ".."
+        || file.filename.contains('/')
+        || file.filename.contains('\\')
+        || !file.filename.to_ascii_lowercase().ends_with(".jar")
+    {
+        return Err(provider_error(
+            source,
+            format!(
+                "The provider returned an invalid mod filename: {}",
+                file.filename
+            ),
+        ));
+    }
+
+    if let Some(size) = file.size.filter(|size| *size > 512 * 1024 * 1024) {
+        return Err(provider_error(
+            source,
+            format!("The mod file is larger than the 512 MiB download limit ({size} bytes)."),
+        ));
+    }
+
+    let bytes = request_bytes(client, &file.url, source).await?;
+    if let Some(expected_size) = file.size.filter(|size| *size > 0)
+        && bytes.len() as u64 != expected_size
+    {
+        return Err(provider_error(
+            source,
+            format!(
+                "Downloaded mod size does not match metadata ({} vs {expected_size} bytes).",
+                bytes.len()
+            ),
+        ));
+    }
+
+    std::fs::create_dir_all(&mods_directory).map_err(|error| {
+        provider_error(
+            source,
+            format!("Could not create the instance mods directory: {error}"),
+        )
+    })?;
+    let destination = mods_directory.join(&file.filename);
+    let mut temporary = tempfile::NamedTempFile::new_in(&mods_directory).map_err(|error| {
+        provider_error(
+            source,
+            format!("Could not create a temporary mod file: {error}"),
+        )
+    })?;
+    temporary.write_all(&bytes).map_err(|error| {
+        provider_error(
+            source,
+            format!("Could not save the downloaded mod: {error}"),
+        )
+    })?;
+    temporary.flush().map_err(|error| {
+        provider_error(
+            source,
+            format!("Could not flush the downloaded mod: {error}"),
+        )
+    })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        provider_error(
+            source,
+            format!("Could not sync the downloaded mod: {error}"),
+        )
+    })?;
+
+    if let Some(expected_sha1) = file.sha1 {
+        let actual_sha1 =
+            mc_launcher_core::io::hash::sha1_file(temporary.path()).map_err(|error| {
+                provider_error(
+                    source,
+                    format!("Could not verify the downloaded mod: {error}"),
+                )
+            })?;
+        if !actual_sha1.eq_ignore_ascii_case(&expected_sha1) {
+            return Err(provider_error(
+                source,
+                "The downloaded mod failed its SHA-1 checksum.".into(),
+            ));
+        }
+    }
+
+    temporary.persist(&destination).map_err(|error| {
+        provider_error(
+            source,
+            format!("Could not install the downloaded mod: {}", error.error),
+        )
+    })?;
+
+    Ok(file.filename)
+}
+
+async fn fetch_compatible_mod_file(
+    client: Arc<dyn HttpClient>,
+    project_id: &str,
+    source: ModSource,
+    compatibility: &ModCompatibilityFilter,
+    curseforge_api_key: Option<String>,
+) -> Result<ModDownloadFile, CatalogProviderError> {
+    match source {
+        ModSource::Modrinth => {
+            let id = project_id.strip_prefix("modrinth:").unwrap_or(project_id);
+            let game_versions = serde_json::to_string(&[compatibility.game_version.as_str()])
+                .map_err(|error| {
+                    provider_error(
+                        source,
+                        format!("Could not prepare the Minecraft version filter: {error}"),
+                    )
+                })?;
+            let loaders = serde_json::to_string(&[compatibility.loader.modrinth_slug()]).map_err(
+                |error| {
+                    provider_error(
+                        source,
+                        format!("Could not prepare the loader filter: {error}"),
+                    )
+                },
+            )?;
+            let url = format!(
+                "https://api.modrinth.com/v2/project/{}/version?game_versions={}&loaders={}&include_changelog=false",
+                encode_query_component(id),
+                encode_query_component(&game_versions),
+                encode_query_component(&loaders),
+            );
+            let body = request_body(client, &url, None, source).await?;
+            let versions: Vec<ModrinthVersion> = serde_json::from_str(&body).map_err(|error| {
+                provider_error(source, format!("Invalid mod versions response: {error}"))
+            })?;
+            let version = versions
+                .into_iter()
+                .find(|version| {
+                    version.game_versions.contains(&compatibility.game_version)
+                        && version
+                            .loaders
+                            .iter()
+                            .any(|loader| loader == compatibility.loader.modrinth_slug())
+                })
+                .ok_or_else(|| {
+                    no_compatible_mod_file(
+                        source,
+                        &compatibility.game_version,
+                        compatibility.loader,
+                    )
+                })?;
+            let file = version
+                .files
+                .iter()
+                .find(|file| file.primary)
+                .or_else(|| version.files.first())
+                .ok_or_else(|| provider_error(source, "The mod version has no files.".into()))?;
+            Ok(ModDownloadFile {
+                url: file.url.clone(),
+                filename: file.filename.clone(),
+                sha1: file.hashes.get("sha1").cloned(),
+                size: Some(file.size),
+            })
+        }
+        ModSource::CurseForge => {
+            let api_key = curseforge_api_key
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| CatalogProviderError {
+                    provider: source,
+                    message:
+                        "Set the CURSEFORGE_API_KEY environment variable to enable CurseForge."
+                            .into(),
+                    missing_api_key: true,
+                })?;
+            let id = project_id
+                .strip_prefix("curseforge:")
+                .unwrap_or(project_id)
+                .parse::<u64>()
+                .map_err(|error| {
+                    provider_error(source, format!("Invalid CurseForge project id: {error}"))
+                })?;
+            let url = format!(
+                "{CURSEFORGE_MOD_DESCRIPTION_URL}/{id}/files?gameVersion={}&modLoaderType={}&pageSize=50&index=0",
+                encode_query_component(&compatibility.game_version),
+                compatibility.loader.curseforge_id(),
+            );
+            let body = request_body(client.clone(), &url, Some(&api_key), source).await?;
+            let response: CurseForgeFilesResponse =
+                serde_json::from_str(&body).map_err(|error| {
+                    provider_error(source, format!("Invalid mod files response: {error}"))
+                })?;
+            let mut compatible_files = response
+                .data
+                .into_iter()
+                .filter(|file| file.game_versions.contains(&compatibility.game_version))
+                .collect::<Vec<_>>();
+            let file_index = compatible_files
+                .iter()
+                .position(|file| file.release_type == 1)
+                .or_else(|| (!compatible_files.is_empty()).then_some(0))
+                .ok_or_else(|| {
+                    no_compatible_mod_file(
+                        source,
+                        &compatibility.game_version,
+                        compatibility.loader,
+                    )
+                })?;
+            let file = compatible_files.swap_remove(file_index);
+            let download_url = match file.download_url.filter(|url| !url.trim().is_empty()) {
+                Some(url) => url,
+                None => {
+                    let url = format!(
+                        "{CURSEFORGE_MOD_DESCRIPTION_URL}/{id}/files/{}/download-url",
+                        file.id
+                    );
+                    let body = request_body(client, &url, Some(&api_key), source).await?;
+                    let response: CurseForgeDownloadUrlResponse = serde_json::from_str(&body)
+                        .map_err(|error| {
+                            provider_error(
+                                source,
+                                format!("Invalid mod download URL response: {error}"),
+                            )
+                        })?;
+                    response.data
+                }
+            };
+            let sha1 = file
+                .hashes
+                .into_iter()
+                .find(|hash| hash.algo == 1)
+                .map(|hash| hash.value);
+            Ok(ModDownloadFile {
+                url: download_url,
+                filename: file.file_name,
+                sha1,
+                size: Some(file.file_length),
+            })
+        }
+        ModSource::All => Err(provider_error(
+            source,
+            "A catalog provider is required to download a mod.".into(),
+        )),
+    }
+}
+
+async fn request_bytes(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    provider: ModSource,
+) -> Result<Vec<u8>, CatalogProviderError> {
+    if !url.starts_with("https://") {
+        return Err(provider_error(
+            provider,
+            "The mod file URL is invalid.".into(),
+        ));
+    }
+    let request = Request::builder()
+        .uri(url)
+        .timeout(Duration::from_secs(120))
+        .body(AsyncBody::empty())
+        .map_err(|error| {
+            provider_error(provider, format!("Could not prepare download: {error}"))
+        })?;
+    let response = client
+        .send(request)
+        .await
+        .map_err(|error| provider_error(provider, format!("Mod download failed: {error}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(provider_error(
+            provider,
+            format!("The mod download returned HTTP {status}."),
+        ));
+    }
+    let mut body = futures::io::AsyncReadExt::take(response.into_body(), 512 * 1024 * 1024 + 1);
+    let mut bytes = Vec::new();
+    futures::io::AsyncReadExt::read_to_end(&mut body, &mut bytes)
+        .await
+        .map_err(|error| {
+            provider_error(provider, format!("Could not read mod download: {error}"))
+        })?;
+    if bytes.len() as u64 > 512 * 1024 * 1024 {
+        return Err(provider_error(
+            provider,
+            "The mod file is larger than the 512 MiB download limit.".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn no_compatible_mod_file(
+    source: ModSource,
+    game_version: &str,
+    loader: super::ModLoaderFilter,
+) -> CatalogProviderError {
+    provider_error(
+        source,
+        format!(
+            "No compatible file found for Minecraft {game_version} with {}.",
+            loader.title(Locale::En)
+        ),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct ModDownloadFile {
+    url: String,
+    filename: String,
+    sha1: Option<String>,
+    size: Option<u64>,
+}
+
 fn collect_provider_results(
     result: &mut ModCatalogResult,
     provider: ModSource,
@@ -139,14 +561,30 @@ async fn search_modrinth(
     client: Arc<dyn HttpClient>,
     query: &str,
     sort: ModSort,
+    compatibility_filter: Option<ModCompatibilityFilter>,
 ) -> Result<Vec<ModProject>, CatalogProviderError> {
     let index = match sort {
         ModSort::Popular => "follows",
         ModSort::Downloads => "downloads",
         ModSort::Name => "relevance",
     };
+    let mut facets = vec![vec!["project_type:mod".to_owned()]];
+    if let Some(filter) = &compatibility_filter {
+        facets.push(vec![format!("versions:{}", filter.game_version)]);
+        facets.push(vec![format!(
+            "categories:{}",
+            filter.loader.modrinth_slug()
+        )]);
+    }
+    let facets = serde_json::to_string(&facets).map_err(|error| {
+        provider_error(
+            ModSource::Modrinth,
+            format!("Could not prepare compatibility filters: {error}"),
+        )
+    })?;
     let mut url = format!(
-        "{MODRINTH_SEARCH_URL}?facets=%5B%5B%22project_type%3Amod%22%5D%5D&index={index}&limit=100"
+        "{MODRINTH_SEARCH_URL}?facets={}&index={index}&limit=100",
+        encode_query_component(&facets)
     );
     if !query.trim().is_empty() {
         url.push_str("&query=");
@@ -164,7 +602,13 @@ async fn search_modrinth(
     Ok(response
         .hits
         .into_iter()
-        .map(ModProject::from_modrinth)
+        .map(|hit| {
+            let mut project = ModProject::from_modrinth(hit);
+            if let Some(filter) = &compatibility_filter {
+                project.game_version = filter.game_version.clone();
+            }
+            project
+        })
         .collect())
 }
 
@@ -173,7 +617,15 @@ async fn search_curseforge(
     query: &str,
     sort: ModSort,
     api_key: Option<String>,
+    compatibility_filter: Option<ModCompatibilityFilter>,
 ) -> Result<Vec<ModProject>, CatalogProviderError> {
+    if compatibility_filter
+        .as_ref()
+        .is_some_and(|filter| filter.loader == super::ModLoaderFilter::Vanilla)
+    {
+        return Ok(Vec::new());
+    }
+
     let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) else {
         return Err(CatalogProviderError {
             provider: ModSource::CurseForge,
@@ -190,6 +642,12 @@ async fn search_curseforge(
     let mut url = format!(
         "{CURSEFORGE_SEARCH_URL}?gameId={CURSEFORGE_MINECRAFT_GAME_ID}&classId={CURSEFORGE_MODS_CLASS_ID}&pageSize=50&index=0&sortField={sort_field}&sortOrder=desc"
     );
+    if let Some(filter) = &compatibility_filter {
+        url.push_str("&gameVersion=");
+        url.push_str(&encode_query_component(&filter.game_version));
+        url.push_str("&modLoaderType=");
+        url.push_str(&filter.loader.curseforge_id().to_string());
+    }
     if !query.trim().is_empty() {
         url.push_str("&searchFilter=");
         url.push_str(&encode_query_component(query.trim()));
@@ -206,7 +664,13 @@ async fn search_curseforge(
     Ok(response
         .data
         .into_iter()
-        .map(ModProject::from_curseforge)
+        .map(|hit| {
+            let mut project = ModProject::from_curseforge(hit);
+            if let Some(filter) = &compatibility_filter {
+                project.game_version = filter.game_version.clone();
+            }
+            project
+        })
         .collect())
 }
 
@@ -269,6 +733,74 @@ fn encode_query_component(value: &str) -> String {
 struct ModrinthSearchResponse {
     #[serde(default)]
     hits: Vec<ModrinthHit>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthProjectDescription {
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct CurseForgeDescriptionResponse {
+    #[serde(default)]
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct ModrinthVersion {
+    #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
+    loaders: Vec<String>,
+    #[serde(default)]
+    files: Vec<ModrinthVersionFile>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthVersionFile {
+    #[serde(default)]
+    hashes: std::collections::HashMap<String, String>,
+    url: String,
+    filename: String,
+    #[serde(default)]
+    primary: bool,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFilesResponse {
+    #[serde(default)]
+    data: Vec<CurseForgeFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFile {
+    id: u64,
+    file_name: String,
+    #[serde(default)]
+    release_type: u32,
+    #[serde(default)]
+    hashes: Vec<CurseForgeFileHash>,
+    #[serde(default)]
+    download_url: Option<String>,
+    #[serde(default)]
+    file_length: u64,
+    #[serde(default)]
+    game_versions: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CurseForgeFileHash {
+    value: String,
+    algo: u32,
+}
+
+#[derive(Deserialize)]
+struct CurseForgeDownloadUrlResponse {
+    data: String,
 }
 
 #[derive(Deserialize)]
