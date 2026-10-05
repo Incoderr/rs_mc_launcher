@@ -124,13 +124,67 @@ pub struct LauncherApp {
 
 impl LauncherApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Поиск по названию, описанию или автору")
+        let mut saved_settings = match profile_store::load_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load launcher settings");
+                profile_store::SavedLauncherSettings::default()
+            }
+        };
+        let default_download_directory = match profile_store::default_download_directory() {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(%error, "launcher default download directory is unavailable");
+                std::path::PathBuf::new()
+            }
+        };
+        if saved_settings.download_directory.as_os_str().is_empty() {
+            saved_settings.download_directory = default_download_directory;
+        }
+
+        let mut settings = SettingsState::default();
+        settings.set_download_directory(saved_settings.download_directory.clone());
+        settings.set_locale(match saved_settings.locale.as_str() {
+            "en" => Locale::En,
+            _ => Locale::Ru,
         });
-        let profile_name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Название профиля"));
-        let loader_version_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Версия загрузчика"));
+        settings.set_theme(match saved_settings.theme.as_str() {
+            "light" => ThemeChoice::Light,
+            _ => ThemeChoice::Dark,
+        });
+        settings.set_accent(match saved_settings.accent.as_str() {
+            "red" => AccentColor::Red,
+            "blue" => AccentColor::Blue,
+            "green" => AccentColor::Green,
+            "purple" => AccentColor::Purple,
+            "pink" => AccentColor::Pink,
+            _ => AccentColor::Orange,
+        });
+        settings.set_hide_to_tray(saved_settings.hide_to_tray);
+
+        let locale = settings.locale();
+        gpui_kit::component::set_locale(locale.tag());
+        Theme::change(
+            match settings.theme() {
+                ThemeChoice::Dark => ThemeMode::Dark,
+                ThemeChoice::Light => ThemeMode::Light,
+            },
+            None,
+            cx,
+        );
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale.text(
+                "Поиск по названию, описанию или автору",
+                "Search by name, description, or author",
+            ))
+        });
+        let profile_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale.text("Название профиля", "Profile name"))
+        });
+        let loader_version_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale.text("Версия загрузчика", "Loader version"))
+        });
         let search_subscription =
             cx.subscribe(&search_input, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -144,23 +198,7 @@ impl LauncherApp {
                     cx.notify();
                 }
             });
-        let default_download_directory = match profile_store::default_download_directory() {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::warn!(%error, "launcher default download directory is unavailable");
-                std::path::PathBuf::new()
-            }
-        };
-        let download_directory = match profile_store::load_download_directory() {
-            Ok(Some(path)) => path,
-            Ok(None) => default_download_directory.clone(),
-            Err(error) => {
-                tracing::warn!(%error, "failed to load launcher download directory");
-                default_download_directory.clone()
-            }
-        };
-        let mut settings = SettingsState::default();
-        settings.set_download_directory(download_directory.clone());
+        let download_directory = saved_settings.download_directory.clone();
 
         let instances = match profile_store::load() {
             Ok(mut profiles) => {
@@ -218,7 +256,33 @@ impl LauncherApp {
                 cx,
             );
         });
+        self.persist_settings();
         cx.notify();
+    }
+
+    fn persist_settings(&self) {
+        let accent = match self.settings.accent() {
+            AccentColor::Orange => "orange",
+            AccentColor::Red => "red",
+            AccentColor::Blue => "blue",
+            AccentColor::Green => "green",
+            AccentColor::Purple => "purple",
+            AccentColor::Pink => "pink",
+        };
+        let saved = profile_store::SavedLauncherSettings {
+            download_directory: self.settings.download_directory().clone(),
+            locale: self.settings.locale().tag().to_owned(),
+            theme: match self.settings.theme() {
+                ThemeChoice::Dark => "dark",
+                ThemeChoice::Light => "light",
+            }
+            .to_owned(),
+            accent: accent.to_owned(),
+            hide_to_tray: self.settings.hide_to_tray(),
+        };
+        if let Err(error) = profile_store::save_settings(&saved) {
+            tracing::error!(%error, "failed to persist launcher settings");
+        }
     }
 
     fn choose_download_directory(&mut self, cx: &mut Context<Self>) {
@@ -251,9 +315,7 @@ impl LauncherApp {
             };
             let _ = this.update(cx, |this, cx| {
                 this.settings.set_download_directory(path.clone());
-                if let Err(error) = profile_store::save_download_directory(path) {
-                    tracing::error!(%error, "failed to persist launcher download directory");
-                }
+                this.persist_settings();
                 cx.notify();
             });
         })
@@ -691,6 +753,20 @@ impl LauncherApp {
                 .mark_failed(id, format!("Не удалось запустить игру: {error}")),
         }
         cx.notify();
+    }
+
+    fn open_profile_directory(&self, id: uuid::Uuid) {
+        let Some(profile) = self.instances.profile(id) else {
+            return;
+        };
+        match profile_store::ensure_instance_directory(&profile.installation_root, id)
+            .and_then(|path| crate::platform::process::open_directory(&path).map(|()| path))
+        {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(profile_id = %id, %error, "failed to open profile directory");
+            }
+        }
     }
 
     fn listen_for_instance_events(
@@ -2179,6 +2255,7 @@ impl LauncherApp {
             )
         };
         let profile_id = profile.id;
+        let folder_label = locale.text("Открыть папку сборки", "Open build folder");
         let mod_filter = ModCompatibilityFilter {
             game_version: profile.game_version.clone(),
             loader: mod_loader_filter(profile.loader),
@@ -2246,6 +2323,21 @@ impl LauncherApp {
                     .items_center()
                     .justify_end()
                     .gap_2()
+                    .child(
+                        UiButton::new(format!("open-instance-folder-{profile_id}"))
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(rgb(palette.control))
+                            .text_color(rgb(palette.muted))
+                            .hover(|style| style.bg(rgb(palette.hover)))
+                            .accessibility_label(folder_label)
+                            .tooltip(move |window, cx| Tooltip::new(folder_label).build(window, cx))
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.open_profile_directory(profile_id);
+                            }))
+                            .child(IconName::FolderOpen),
+                    )
                     .child(
                         UiButton::new(format!("add-mods-instance-{profile_id}"))
                             .px_3()
@@ -3522,6 +3614,7 @@ impl LauncherApp {
             .accessibility_label(locale.text("Скрывать в трей", "Hide to tray"))
             .on_change(cx.listener(|this, checked, _, cx| {
                 this.settings.set_hide_to_tray(*checked);
+                this.persist_settings();
                 cx.notify();
             }));
 
@@ -3744,6 +3837,7 @@ impl LauncherApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings.set_theme(ThemeChoice::Dark);
                                 Theme::change(ThemeMode::Dark, None, cx);
+                                this.persist_settings();
                                 cx.notify();
                             }))
                             .child(
@@ -3787,6 +3881,7 @@ impl LauncherApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings.set_theme(ThemeChoice::Light);
                                 Theme::change(ThemeMode::Light, None, cx);
+                                this.persist_settings();
                                 cx.notify();
                             }))
                             .child(
@@ -3840,6 +3935,7 @@ impl LauncherApp {
                     .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.set_accent(color);
+                        this.persist_settings();
                         cx.notify();
                     }))
                     .child(check)

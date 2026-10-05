@@ -5,9 +5,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::features::instances::InstanceProfile;
 
-#[derive(Deserialize, Serialize)]
-struct SavedLauncherSettings {
-    download_directory: PathBuf,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SavedLauncherSettings {
+    pub download_directory: PathBuf,
+    pub locale: String,
+    pub theme: String,
+    pub accent: String,
+    pub hide_to_tray: bool,
+}
+
+impl Default for SavedLauncherSettings {
+    fn default() -> Self {
+        Self {
+            download_directory: PathBuf::new(),
+            locale: "ru".to_owned(),
+            theme: "dark".to_owned(),
+            accent: "orange".to_owned(),
+            hide_to_tray: false,
+        }
+    }
 }
 
 pub fn load() -> std::io::Result<Vec<InstanceProfile>> {
@@ -26,25 +43,21 @@ pub fn save(profiles: &[InstanceProfile]) -> std::io::Result<()> {
     write_json_atomically(&profiles_path()?, profiles)
 }
 
-pub fn load_download_directory() -> std::io::Result<Option<PathBuf>> {
+pub fn load_settings() -> std::io::Result<SavedLauncherSettings> {
     let path = settings_path()?;
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SavedLauncherSettings::default());
+        }
         Err(error) => return Err(error),
     };
-    let saved: SavedLauncherSettings = serde_json::from_slice(&bytes)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    Ok(Some(saved.download_directory))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-pub fn save_download_directory(path: PathBuf) -> std::io::Result<()> {
-    write_json_atomically(
-        &settings_path()?,
-        &SavedLauncherSettings {
-            download_directory: path,
-        },
-    )
+pub fn save_settings(settings: &SavedLauncherSettings) -> std::io::Result<()> {
+    write_json_atomically(&settings_path()?, settings)
 }
 
 pub fn default_download_directory() -> std::io::Result<PathBuf> {
