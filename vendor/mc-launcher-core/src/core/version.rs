@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::rules::Rule;
+use super::{maven::MavenCoordinate, rules::Rule};
 
 /// Minecraft version or loader profile metadata.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
@@ -218,6 +218,11 @@ impl VersionJson {
         self.assets = child.assets.clone().or(self.assets);
         self.asset_index = child.asset_index.clone().or(self.asset_index);
         self.downloads.extend(child.downloads.clone());
+        for child_library in &child.libraries {
+            self.libraries.retain(|parent_library| {
+                !has_maven_version_conflict(&parent_library.name, &child_library.name)
+            });
+        }
         self.libraries.extend(child.libraries.clone());
         self.arguments.game.extend(child.arguments.game.clone());
         self.arguments.jvm.extend(child.arguments.jvm.clone());
@@ -233,4 +238,16 @@ impl VersionJson {
         self.compliance_level = child.compliance_level.or(self.compliance_level);
         self
     }
+}
+
+fn has_maven_version_conflict(left: &str, right: &str) -> bool {
+    let (Ok(left), Ok(right)) = (MavenCoordinate::parse(left), MavenCoordinate::parse(right)) else {
+        return false;
+    };
+
+    left.group == right.group
+        && left.artifact == right.artifact
+        && left.classifier == right.classifier
+        && left.extension == right.extension
+        && left.version != right.version
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use futures::channel::mpsc::UnboundedSender;
 use mc_launcher_core::prelude::{
@@ -226,7 +227,7 @@ impl InstancesState {
             .insert(id, InstanceRuntime::Running { process_id });
     }
 
-    pub fn mark_game_stopped(&mut self, id: Uuid, exit_code: Option<i32>) {
+    pub fn mark_game_stopped(&mut self, id: Uuid, exit_code: Option<i32>, stderr: Option<String>) {
         if self
             .profiles
             .iter()
@@ -238,7 +239,15 @@ impl InstancesState {
                 self.runtime.insert(
                     id,
                     InstanceRuntime::Failed {
-                        message: format!("Minecraft завершился с кодом {exit_code:?}"),
+                        message: stderr.map_or_else(
+                            || format!("Minecraft завершился с кодом {exit_code:?}"),
+                            |stderr| {
+                                format!(
+                                    "Minecraft завершился с кодом {exit_code:?}:\n{}",
+                                    stderr.trim()
+                                )
+                            },
+                        ),
                     },
                 );
             }
@@ -272,6 +281,7 @@ pub enum InstanceWorkerEvent {
     GameExited {
         id: Uuid,
         code: Option<i32>,
+        stderr: Option<String>,
     },
     LaunchFailed {
         id: Uuid,
@@ -435,6 +445,25 @@ pub fn launch_profile(
             return;
         }
     };
+
+    let java_executable = profile
+        .java_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new("java"));
+    let java_major_version = java_major_version(java_executable);
+    if version.main_class.as_deref() == Some("net.minecraft.launchwrapper.Launch")
+        && java_major_version.is_some_and(|major_version| major_version >= 9)
+    {
+        let _ = events.unbounded_send(InstanceWorkerEvent::LaunchFailed {
+            id,
+            message: format!(
+                "Эта версия LaunchWrapper несовместима с Java 9 и новее (обнаружена Java {}). Установите Java 8 и выберите её java.exe в настройках профиля.",
+                java_major_version.unwrap_or_default()
+            ),
+        });
+        return;
+    }
+
     let command = match launcher.build_launch_command_from_version(
         &version,
         LaunchOptions {
@@ -469,7 +498,11 @@ pub fn launch_profile(
     );
 
     let mut process = Command::new(&command.executable);
-    process.args(&launch_args).current_dir(&command.working_dir);
+    process
+        .args(&launch_args)
+        .current_dir(&command.working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, value) in &command.env {
         process.env(key, value);
     }
@@ -488,11 +521,56 @@ pub fn launch_profile(
         id,
         process_id: child.id(),
     });
+
+    let stdout_reader =
+        match spawn_output_reader(child.stdout.take(), format!("read-minecraft-stdout-{id}")) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = events.unbounded_send(InstanceWorkerEvent::LaunchFailed {
+                    id,
+                    message: format!("Не удалось прочитать вывод Java: {error}"),
+                });
+                return;
+            }
+        };
+    let stderr_reader =
+        match spawn_output_reader(child.stderr.take(), format!("read-minecraft-stderr-{id}")) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(reader) = stdout_reader {
+                    let _ = reader.join();
+                }
+                let _ = events.unbounded_send(InstanceWorkerEvent::LaunchFailed {
+                    id,
+                    message: format!("Не удалось прочитать вывод Java: {error}"),
+                });
+                return;
+            }
+        };
+
     match child.wait() {
         Ok(status) => {
+            let stdout = stdout_reader
+                .and_then(|reader| reader.join().ok())
+                .filter(|stdout| !stdout.trim().is_empty());
+            let stderr = stderr_reader
+                .and_then(|reader| reader.join().ok())
+                .filter(|stderr| !stderr.trim().is_empty());
+            let launch_details = format!(
+                "Java: {} (версия {})\nSTDOUT:\n{}\nSTDERR:\n{}",
+                command.executable.display(),
+                java_major_version.map_or_else(|| "не определена".to_owned(), |v| v.to_string()),
+                stdout.unwrap_or_default().trim(),
+                stderr.unwrap_or_default().trim(),
+            );
             let _ = events.unbounded_send(InstanceWorkerEvent::GameExited {
                 id,
                 code: status.code(),
+                stderr: Some(launch_details),
             });
         }
         Err(error) => {
@@ -501,6 +579,71 @@ pub fn launch_profile(
                 message: format!("Не удалось дождаться завершения игры: {error}"),
             });
         }
+    }
+}
+
+fn spawn_output_reader<R>(
+    stream: Option<R>,
+    name: String,
+) -> std::io::Result<Option<std::thread::JoinHandle<String>>>
+where
+    R: Read + Send + 'static,
+{
+    stream
+        .map(|stream| {
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(move || read_output_tail(stream))
+        })
+        .transpose()
+}
+
+fn read_output_tail(mut stream: impl Read) -> String {
+    const MAX_CAPTURED_BYTES: usize = 6 * 1024;
+
+    let mut captured = Vec::new();
+    let mut buffer = [0; 2048];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(bytes_read) => {
+                captured.extend_from_slice(&buffer[..bytes_read]);
+                if captured.len() > MAX_CAPTURED_BYTES {
+                    let excess = captured.len() - MAX_CAPTURED_BYTES;
+                    captured.drain(..excess);
+                }
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
+fn java_major_version(java_executable: &Path) -> Option<u32> {
+    let output = Command::new(java_executable)
+        .arg("-version")
+        .output()
+        .ok()?;
+    let version = [
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ]
+    .into_iter()
+    .find_map(|stream| {
+        stream
+            .lines()
+            .find_map(|line| line.split('"').nth(1).map(str::to_owned))
+    })?;
+
+    let mut components = version
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|component| !component.is_empty())
+        .filter_map(|component| component.parse::<u32>().ok());
+    let first = components.next()?;
+    if first == 1 {
+        components.next()
+    } else {
+        Some(first)
     }
 }
 

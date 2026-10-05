@@ -492,8 +492,8 @@ impl LauncherApp {
             InstanceWorkerEvent::Launched { id, process_id } => {
                 self.instances.mark_running(id, process_id);
             }
-            InstanceWorkerEvent::GameExited { id, code } => {
-                self.instances.mark_game_stopped(id, code);
+            InstanceWorkerEvent::GameExited { id, code, stderr } => {
+                self.instances.mark_game_stopped(id, code, stderr);
             }
         }
     }
