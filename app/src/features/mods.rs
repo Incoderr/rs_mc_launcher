@@ -64,6 +64,55 @@ pub enum ModSort {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectKind {
+    #[default]
+    Mod,
+    Modpack,
+    ResourcePack,
+    Shader,
+}
+
+impl ProjectKind {
+    pub fn title(self, locale: Locale) -> &'static str {
+        match self {
+            Self::Mod => locale.text("Моды", "Mods"),
+            Self::Modpack => locale.text("Модпаки", "Modpacks"),
+            Self::ResourcePack => locale.text("Текстурпаки", "Texture packs"),
+            Self::Shader => locale.text("Шейдеры", "Shaders"),
+        }
+    }
+
+    pub(crate) fn modrinth_type(self) -> &'static str {
+        match self {
+            Self::Mod => "mod",
+            Self::Modpack => "modpack",
+            Self::ResourcePack => "resourcepack",
+            Self::Shader => "shader",
+        }
+    }
+
+    pub(crate) fn curseforge_class_id(self) -> u32 {
+        match self {
+            Self::Mod => 6,
+            Self::Modpack => 4471,
+            Self::ResourcePack => 12,
+            Self::Shader => 6552,
+        }
+    }
+
+    pub(crate) fn modrinth_path(self) -> &'static str {
+        match self {
+            Self::Mod => "mod",
+            Self::Modpack => "modpack",
+            Self::ResourcePack => "resourcepack",
+            Self::Shader => "shader",
+        }
+    }
+}
+
+pub const CATALOG_PAGE_SIZE: usize = 24;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModDetailTab {
     #[default]
     Description,
@@ -237,11 +286,15 @@ pub const SAMPLE_MODS: &[ModSample] = &[
 
 #[derive(Debug, Default)]
 pub struct ModsState {
+    kind: ProjectKind,
     category: ModCategory,
     sort: ModSort,
     source: catalog::ModSource,
     query: String,
     projects: Vec<catalog::ModProject>,
+    total_results: usize,
+    page_count: usize,
+    page: usize,
     errors: Vec<catalog::CatalogProviderError>,
     loading: bool,
     request_id: u64,
@@ -255,6 +308,22 @@ pub struct ModsState {
 }
 
 impl ModsState {
+    pub fn kind(&self) -> ProjectKind {
+        self.kind
+    }
+
+    pub fn set_kind(&mut self, kind: ProjectKind) {
+        if self.kind != kind {
+            self.kind = kind;
+            self.category = ModCategory::All;
+            self.page = 0;
+            if kind != ProjectKind::Mod {
+                self.compatibility_filter = None;
+            }
+            self.invalidate_search();
+        }
+    }
+
     pub fn category(&self) -> ModCategory {
         self.category
     }
@@ -270,16 +339,36 @@ impl ModsState {
     pub fn set_source(&mut self, source: catalog::ModSource) {
         if self.source != source {
             self.source = source;
+            self.page = 0;
             self.invalidate_search();
         }
     }
 
     pub fn set_category(&mut self, category: ModCategory) {
         self.category = category;
+        self.page = 0;
     }
 
     pub fn set_sort(&mut self, sort: ModSort) {
         self.sort = sort;
+        self.page = 0;
+    }
+
+    pub fn page(&self) -> usize {
+        self.page + 1
+    }
+
+    pub fn total_pages(&self) -> usize {
+        self.page_count.max(1)
+    }
+
+    pub fn set_page(&mut self, page: usize) {
+        self.page = page.clamp(1, self.total_pages()) - 1;
+        self.invalidate_search();
+    }
+
+    pub fn total_results(&self) -> usize {
+        self.total_results
     }
 
     pub fn compatibility_filter(&self) -> Option<&ModCompatibilityFilter> {
@@ -289,12 +378,14 @@ impl ModsState {
     pub fn set_compatibility_filter(&mut self, filter: ModCompatibilityFilter) {
         if self.compatibility_filter.as_ref() != Some(&filter) {
             self.compatibility_filter = Some(filter);
+            self.page = 0;
             self.invalidate_search();
         }
     }
 
     pub fn clear_compatibility_filter(&mut self) {
         if self.compatibility_filter.take().is_some() {
+            self.page = 0;
             self.invalidate_search();
         }
     }
@@ -302,6 +393,7 @@ impl ModsState {
     pub fn set_query(&mut self, query: String) {
         if self.query != query {
             self.query = query;
+            self.page = 0;
             self.invalidate_search();
         }
     }
@@ -389,6 +481,8 @@ impl ModsState {
         ModSort,
         catalog::ModSource,
         Option<ModCompatibilityFilter>,
+        ProjectKind,
+        usize,
     ) {
         self.request_id = self.request_id.wrapping_add(1);
         self.loading = true;
@@ -399,6 +493,8 @@ impl ModsState {
             self.sort,
             self.source,
             self.compatibility_filter.clone(),
+            self.kind,
+            self.page(),
         )
     }
 
@@ -412,6 +508,8 @@ impl ModsState {
         }
         self.loading = false;
         self.projects = result.projects;
+        self.total_results = result.total_results;
+        self.page_count = result.page_count;
         self.errors = result.errors;
         true
     }

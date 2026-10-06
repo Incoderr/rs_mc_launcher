@@ -1,4 +1,4 @@
-use crate::features::settings::Locale;
+use crate::features::{mods::ProjectKind, settings::Locale};
 use gpui_kit::assets::IconName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,10 +29,20 @@ impl Page {
             Self::Instances => locale.text("Сборки", "Builds"),
             Self::Modpacks => locale.text("Модпаки", "Modpacks"),
             Self::Mods => locale.text("Моды", "Mods"),
-            Self::ResourcePacks => locale.text("Ресурспаки", "Resource packs"),
+            Self::ResourcePacks => locale.text("Текстурпаки", "Texture packs"),
             Self::Shaders => locale.text("Шейдеры", "Shaders"),
             Self::Settings => locale.text("Настройки", "Settings"),
-            Self::ModDetails => locale.text("Мод", "Mod"),
+            Self::ModDetails => locale.text("Проект", "Project"),
+        }
+    }
+
+    pub fn catalog_kind(self) -> Option<ProjectKind> {
+        match self {
+            Self::Modpacks => Some(ProjectKind::Modpack),
+            Self::Mods => Some(ProjectKind::Mod),
+            Self::ResourcePacks => Some(ProjectKind::ResourcePack),
+            Self::Shaders => Some(ProjectKind::Shader),
+            _ => None,
         }
     }
 

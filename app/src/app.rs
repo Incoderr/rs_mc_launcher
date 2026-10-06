@@ -6,7 +6,7 @@ use crate::{
     },
     features::mods::{
         ModCategory, ModCompatibilityFilter, ModDetailTab, ModLoaderFilter, ModSample, ModSort,
-        ModsState, SAMPLE_MODS,
+        ModsState, ProjectKind, SAMPLE_MODS,
         catalog::{
             ModProject, ModSource, fetch_project_description, install_compatible_mod,
             search_catalog,
@@ -118,7 +118,6 @@ pub struct LauncherApp {
     loader_version_input: Entity<InputState>,
     manifest_scroll: gpui_kit::base::VirtualListScrollHandle,
     mods_scroll: gpui_kit::base::VirtualListScrollHandle,
-    search_query: String,
     _search_subscription: Subscription,
 }
 
@@ -189,10 +188,9 @@ impl LauncherApp {
             cx.subscribe(&search_input, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let query = input.read(cx).value().to_string();
-                    this.search_query = query.clone();
                     this.mods.set_query(query);
                     this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                    if this.active_page == Page::Mods {
+                    if this.active_page.catalog_kind().is_some() {
                         this.load_mod_catalog(cx, true);
                     }
                     cx.notify();
@@ -228,7 +226,6 @@ impl LauncherApp {
             loader_version_input,
             manifest_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             mods_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
-            search_query: String::new(),
             _search_subscription: search_subscription,
         }
     }
@@ -379,20 +376,27 @@ impl LauncherApp {
             return;
         }
 
+        let is_catalog_detail_transition =
+            page == Page::ModDetails || self.active_page == Page::ModDetails;
         self.active_page = page;
-        self.search_query.clear();
-        self.mods.set_query(String::new());
-        self.search_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        if !is_catalog_detail_transition {
+            self.mods.set_query(String::new());
+            self.search_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if let Some(kind) = page.catalog_kind() {
+            self.mods.set_kind(kind);
+        }
         self.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
-        if page == Page::Mods {
+        if page.catalog_kind().is_some() {
             self.load_mod_catalog(cx, false);
         }
         cx.notify();
     }
 
     fn load_mod_catalog(&mut self, cx: &mut Context<Self>, debounce: bool) {
-        let (request_id, query, sort, source, compatibility_filter) = self.mods.begin_search();
+        let (request_id, query, sort, source, compatibility_filter, kind, page) =
+            self.mods.begin_search();
         let client = cx.http_client();
         let curseforge_api_key = std::env::var("CURSEFORGE_API_KEY").ok();
         cx.notify();
@@ -417,6 +421,8 @@ impl LauncherApp {
                 source,
                 curseforge_api_key,
                 compatibility_filter,
+                kind,
+                page,
             )
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -1866,10 +1872,15 @@ impl LauncherApp {
     }
 
     fn home_page(&self, palette: Palette, locale: Locale, cx: &Context<Self>) -> AnyElement {
-        let destinations: Vec<_> = [Page::Modpacks, Page::Mods, Page::ResourcePacks]
-            .into_iter()
-            .map(|page| self.destination_card(page, palette, locale, cx))
-            .collect();
+        let destinations: Vec<_> = [
+            Page::Modpacks,
+            Page::Mods,
+            Page::ResourcePacks,
+            Page::Shaders,
+        ]
+        .into_iter()
+        .map(|page| self.destination_card(page, palette, locale, cx))
+        .collect();
 
         let popular_cards: Vec<_> = SAMPLE_MODS
             .iter()
@@ -1915,9 +1926,9 @@ impl LauncherApp {
                                     .text_size(px(13.))
                                     .text_color(rgb(palette.muted))
                                     .child(locale.text(
-                                        "Моды, сборки и ресурспаки — в одном лаунчере.",
-                                        "Mods, modpacks, and resource packs in one launcher.",
-                                    )),
+                                    "Моды, модпаки, текстурпаки и шейдеры — в одном лаунчере.",
+                                    "Mods, modpacks, texture packs, and shaders in one launcher.",
+                                )),
                             )
                             .child(
                                 UiButton::new("home-browse-mods")
@@ -2426,7 +2437,8 @@ impl LauncherApp {
         let description = match page {
             Page::Modpacks => locale.text("Готовые сборки", "Curated collections"),
             Page::Mods => locale.text("Дополнения для игры", "Add-ons for your game"),
-            Page::ResourcePacks => locale.text("Новый стиль мира", "A new look for your world"),
+            Page::ResourcePacks => locale.text("Новые текстуры", "New textures"),
+            Page::Shaders => locale.text("Новая графика", "New visuals"),
             _ => "",
         };
 
@@ -2573,30 +2585,34 @@ impl LauncherApp {
     }
 
     fn mods_page(&self, palette: Palette, locale: Locale, cx: &Context<Self>) -> AnyElement {
+        let selected_kind = self.mods.kind();
         let selected_category = self.mods.category();
         let selected_sort = self.mods.sort();
         let selected_source = self.mods.source();
-        let target_filter_chip = self.mods.compatibility_filter().map(|filter| {
-            let label = format!(
-                "{} · Minecraft {} · {} ×",
-                locale.text("Сборка", "Build"),
-                filter.game_version,
-                filter.loader.title(locale)
-            );
-            UiButton::new("clear-mod-compatibility-filter")
-                .px_3()
-                .py_2()
-                .rounded(px(8.))
-                .bg(rgb(palette.selected))
-                .text_color(rgb(palette.accent))
-                .hover(|style| style.bg(rgb(palette.hover)))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.mods.clear_compatibility_filter();
-                    this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                    this.load_mod_catalog(cx, false);
-                }))
-                .child(label)
-        });
+        let target_filter_chip = (selected_kind == ProjectKind::Mod)
+            .then(|| self.mods.compatibility_filter())
+            .flatten()
+            .map(|filter| {
+                let label = format!(
+                    "{} · Minecraft {} · {} ×",
+                    locale.text("Сборка", "Build"),
+                    filter.game_version,
+                    filter.loader.title(locale)
+                );
+                UiButton::new("clear-mod-compatibility-filter")
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.))
+                    .bg(rgb(palette.selected))
+                    .text_color(rgb(palette.accent))
+                    .hover(|style| style.bg(rgb(palette.hover)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.mods.clear_compatibility_filter();
+                        this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        this.load_mod_catalog(cx, false);
+                    }))
+                    .child(label)
+            });
         let categories: Vec<_> = ModCategory::ALL
             .into_iter()
             .map(|category| {
@@ -2622,6 +2638,7 @@ impl LauncherApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.mods.set_category(category);
                         this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        this.load_mod_catalog(cx, false);
                         cx.notify();
                     }))
                     .child(category.title(locale))
@@ -2714,6 +2731,57 @@ impl LauncherApp {
             });
 
         let visible_count = self.mods.visible_mods().len();
+        let current_page = self.mods.page();
+        let total_pages = self.mods.total_pages();
+        let is_loading = self.mods.is_loading();
+        let previous_owner = cx.entity().downgrade();
+        let next_owner = cx.entity().downgrade();
+        let pagination = div()
+            .h_flex()
+            .w_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                UiButton::new("mods-page-previous")
+                    .px_3()
+                    .py_2()
+                    .rounded(px(7.))
+                    .bg(rgb(palette.control))
+                    .text_color(rgb(palette.foreground))
+                    .disabled(current_page <= 1 || is_loading)
+                    .on_click(move |_, _, cx| {
+                        let _ = previous_owner.update(cx, |this, cx| {
+                            this.mods.set_page(current_page.saturating_sub(1));
+                            this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            this.load_mod_catalog(cx, false);
+                        });
+                    })
+                    .child(locale.text("Назад", "Previous")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.muted))
+                    .child(format!("{current_page} / {total_pages}")),
+            )
+            .child(
+                UiButton::new("mods-page-next")
+                    .px_3()
+                    .py_2()
+                    .rounded(px(7.))
+                    .bg(rgb(palette.control))
+                    .text_color(rgb(palette.foreground))
+                    .disabled(current_page >= total_pages || is_loading)
+                    .on_click(move |_, _, cx| {
+                        let _ = next_owner.update(cx, |this, cx| {
+                            this.mods.set_page(current_page.saturating_add(1));
+                            this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            this.load_mod_catalog(cx, false);
+                        });
+                    })
+                    .child(locale.text("Дальше", "Next")),
+            );
         let item_sizes = Rc::new(vec![size(px(1.), px(96.)); visible_count]);
         let scroll_handle = self.mods_scroll.clone();
         let errors = self.mods.errors().iter().map(|error| {
@@ -2747,7 +2815,7 @@ impl LauncherApp {
                     div().size_full().min_w_0().child(
                         gpui_kit::base::v_virtual_list(
                             cx.entity(),
-                            "mods-catalog-virtual-list",
+                            format!("{:?}-catalog-virtual-list", selected_kind),
                             item_sizes,
                             move |this, visible_range, _, cx| {
                                 let projects = this.mods.visible_mods();
@@ -2773,11 +2841,11 @@ impl LauncherApp {
                 .into_any_element()
         } else {
             let message = if self.mods.is_loading() {
-                locale.text("Загружаем каталог модов…", "Loading mod catalog…")
+                locale.text("Загружаем каталог…", "Loading catalog…")
             } else if self.mods.errors().is_empty() {
-                locale.text("Ничего не найдено", "No mods found")
+                locale.text("Ничего не найдено", "No results found")
             } else {
-                locale.text("Не удалось загрузить моды", "Could not load mods")
+                locale.text("Не удалось загрузить каталог", "Could not load catalog")
             };
             div()
                 .flex_1()
@@ -2827,8 +2895,12 @@ impl LauncherApp {
                             .gap_2()
                             .text_size(px(13.))
                             .text_color(rgb(palette.muted))
-                            .child(locale.text("Каталог модов", "Mod catalog"))
-                            .child(format!("({visible_count})"))
+                            .child(selected_kind.title(locale))
+                            .child(format!(
+                                "({} / {})",
+                                visible_count,
+                                self.mods.total_results()
+                            ))
                             .when(self.mods.is_loading(), |this| {
                                 this.child(IconName::LoaderCircle)
                             }),
@@ -2836,18 +2908,21 @@ impl LauncherApp {
                     .child(sort_menu),
             )
             .child(div().h_flex().w_full().gap_2().children(sources))
-            .child(
-                div()
-                    .h_flex()
-                    .w_full()
-                    .h(px(38.))
-                    .gap_2()
-                    .overflow_x_scrollbar()
-                    .children(categories),
-            )
+            .when(selected_kind == ProjectKind::Mod, |this| {
+                this.child(
+                    div()
+                        .h_flex()
+                        .w_full()
+                        .h(px(38.))
+                        .gap_2()
+                        .overflow_x_scrollbar()
+                        .children(categories),
+                )
+            })
             .children(errors)
             .when_some(retry, |this, button| this.child(button))
             .child(cards_content)
+            .child(pagination)
             .into_any_element()
     }
 
@@ -2860,7 +2935,6 @@ impl LauncherApp {
     ) -> AnyElement {
         let description = project.description.clone();
         let project_id = project.id.clone();
-        let download_project = project.clone();
         let selected_project = project.clone();
         let tags: Vec<_> = project
             .categories
@@ -2885,7 +2959,7 @@ impl LauncherApp {
             .py_2()
             .rounded(px(8.))
             .text_color(rgb(palette.foreground))
-            .accessibility_label(locale.text("Открыть страницу мода", "Open mod details"))
+            .accessibility_label(locale.text("Открыть описание проекта", "Open project details"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 let request_id = this.mods.select_mod(selected_project.clone());
                 this.load_mod_description(
@@ -2975,6 +3049,34 @@ impl LauncherApp {
                     ),
             );
 
+        let action = if project.kind == ProjectKind::Mod {
+            let download_project = project.clone();
+            UiButton::new(format!("download-mod-{project_id}"))
+                .px_3()
+                .py_2()
+                .rounded(px(7.))
+                .bg(rgb(palette.accent))
+                .text_color(rgb(palette.accent_foreground))
+                .hover(|style| style.opacity(0.9))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_mod_download_dialog(download_project.clone(), window, cx);
+                }))
+                .child(locale.text("Скачать", "Download"))
+                .into_any_element()
+        } else {
+            let page_url = project.page_url.clone();
+            UiButton::new(format!("open-project-{project_id}"))
+                .px_3()
+                .py_2()
+                .rounded(px(7.))
+                .bg(rgb(palette.control))
+                .text_color(rgb(palette.foreground))
+                .hover(|style| style.bg(rgb(palette.hover)))
+                .on_click(move |_, _, cx| cx.open_url(&page_url))
+                .child(locale.text("Открыть", "Open"))
+                .into_any_element()
+        };
+
         div()
             .h_flex()
             .w_full()
@@ -3015,19 +3117,7 @@ impl LauncherApp {
                             .text_color(rgb(palette.muted))
                             .child(project.source.title(locale)),
                     )
-                    .child(
-                        UiButton::new(format!("download-mod-{project_id}"))
-                            .px_3()
-                            .py_2()
-                            .rounded(px(7.))
-                            .bg(rgb(palette.accent))
-                            .text_color(rgb(palette.accent_foreground))
-                            .hover(|style| style.opacity(0.9))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_mod_download_dialog(download_project.clone(), window, cx);
-                            }))
-                            .child(locale.text("Скачать", "Download")),
-                    ),
+                    .child(action),
             )
             .into_any_element()
     }
@@ -3038,7 +3128,13 @@ impl LauncherApp {
         };
         let active_tab = self.mods.detail_tab();
         let project_url = sample.page_url.clone();
-        let download_project = sample.clone();
+        let project_kind = sample.kind;
+        let back_page = match project_kind {
+            ProjectKind::Mod => Page::Mods,
+            ProjectKind::Modpack => Page::Modpacks,
+            ProjectKind::ResourcePack => Page::ResourcePacks,
+            ProjectKind::Shader => Page::Shaders,
+        };
 
         let back_button = UiButton::new("mod-details-back")
             .px_2()
@@ -3047,10 +3143,10 @@ impl LauncherApp {
             .bg(rgb(palette.background))
             .text_color(rgb(palette.muted))
             .hover(|style| style.bg(rgb(palette.hover)))
-            .accessibility_label(locale.text("Назад к модам", "Back to mods"))
-            .on_click(cx.listener(|this, _, window, cx| {
+            .accessibility_label(locale.text("Назад в каталог", "Back to catalog"))
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.mods.clear_selected_mod();
-                this.navigate_to(Page::Mods, window, cx);
+                this.navigate_to(back_page, window, cx);
             }))
             .child(
                 div()
@@ -3076,6 +3172,35 @@ impl LauncherApp {
                     .into_any_element()
             })
             .collect();
+
+        let primary_action = if project_kind == ProjectKind::Mod {
+            let download_project = sample.clone();
+            UiButton::new(format!("details-download-{}", sample.id))
+                .px_3()
+                .py_2()
+                .rounded(px(7.))
+                .bg(rgb(palette.accent))
+                .text_color(rgb(palette.accent_foreground))
+                .hover(|style| style.opacity(0.9))
+                .accessibility_label(locale.text("Скачать мод", "Download mod"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_mod_download_dialog(download_project.clone(), window, cx);
+                }))
+                .child(locale.text("Скачать", "Download"))
+                .into_any_element()
+        } else {
+            let page_url = project_url.clone();
+            UiButton::new(format!("open-project-page-{}", sample.id))
+                .px_3()
+                .py_2()
+                .rounded(px(7.))
+                .bg(rgb(palette.accent))
+                .text_color(rgb(palette.accent_foreground))
+                .hover(|style| style.opacity(0.9))
+                .on_click(move |_, _, cx| cx.open_url(&page_url))
+                .child(locale.text("Открыть страницу", "Open project page"))
+                .into_any_element()
+        };
 
         let hero = div()
             .h_flex()
@@ -3159,20 +3284,7 @@ impl LauncherApp {
                             .text_color(rgb(palette.muted))
                             .child(sample.game_version.clone()),
                     )
-                    .child(
-                        UiButton::new(format!("details-download-{}", sample.id))
-                            .px_3()
-                            .py_2()
-                            .rounded(px(7.))
-                            .bg(rgb(palette.accent))
-                            .text_color(rgb(palette.accent_foreground))
-                            .hover(|style| style.opacity(0.9))
-                            .accessibility_label(locale.text("Скачать мод", "Download mod"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_mod_download_dialog(download_project.clone(), window, cx);
-                            }))
-                            .child(locale.text("Скачать", "Download")),
-                    )
+                    .child(primary_action)
                     .child(
                         UiButton::new(format!("open-mod-page-{}", sample.id))
                             .px_3()
@@ -3186,7 +3298,12 @@ impl LauncherApp {
                     ),
             );
 
-        let tabs: Vec<_> = ModDetailTab::ALL
+        let detail_tabs = if project_kind == ProjectKind::Mod {
+            ModDetailTab::ALL.to_vec()
+        } else {
+            vec![ModDetailTab::Description]
+        };
+        let tabs: Vec<_> = detail_tabs
             .into_iter()
             .map(|tab| {
                 let is_selected = tab == active_tab;
@@ -3364,6 +3481,11 @@ impl LauncherApp {
                                 .into_any_element()
                         })
                     };
+                let screenshots = if sample.kind == ProjectKind::Mod {
+                    self.mod_screenshots(sample, palette, locale)
+                } else {
+                    div().into_any_element()
+                };
 
                 div()
                     .v_flex()
@@ -3400,7 +3522,7 @@ impl LauncherApp {
                                     }),
                             ),
                     )
-                    .child(self.mod_screenshots(sample, palette, locale))
+                    .child(screenshots)
                     .into_any_element()
             }
             ModDetailTab::Files => div()
@@ -3521,32 +3643,6 @@ impl LauncherApp {
             .text_size(px(13.))
             .text_color(rgb(palette.muted))
             .child(locale.text("Здесь пока пусто", "Nothing here yet"))
-            .into_any_element()
-    }
-
-    fn search_empty_page(&self, palette: Palette, locale: Locale) -> AnyElement {
-        let message = if self.search_query.trim().is_empty() {
-            locale.text("Раздел пока пуст", "This section is empty for now")
-        } else {
-            locale.text("Ничего не найдено", "No results found")
-        };
-
-        div()
-            .v_flex()
-            .w_full()
-            .flex_1()
-            .min_h_0()
-            .gap_4()
-            .child(self.search_bar(palette, locale))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(palette.muted))
-                    .child(message),
-            )
             .into_any_element()
     }
 
@@ -3996,20 +4092,6 @@ impl LauncherApp {
                     .border_color(rgb(palette.border))
                     .child(
                         div()
-                            .h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(brand_mark(palette, px(24.)))
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(palette.foreground))
-                                    .child("Minecraft Launcher"),
-                            ),
-                    )
-                    .child(
-                        div()
                             .v_flex()
                             .gap_1()
                             .child(
@@ -4084,34 +4166,13 @@ impl Render for LauncherApp {
             .collect();
         let settings_button = self.navigation_button(Page::Settings, palette, locale, cx);
         let collapse_button = self.sidebar_toggle_button(palette, locale, cx);
-        let sidebar_header = if self.sidebar.is_collapsed() {
-            div()
-                .h_flex()
-                .w_full()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .child(brand_mark(palette, px(20.)))
-                .child(collapse_button)
-                .into_any_element()
-        } else {
-            div()
-                .h_flex()
-                .w_full()
-                .items_center()
-                .gap_3()
-                .child(brand_mark(palette, px(36.)))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(14.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(palette.foreground))
-                        .child("Minecraft Launcher"),
-                )
-                .child(collapse_button)
-                .into_any_element()
-        };
+        let sidebar_header = div()
+            .h_flex()
+            .w_full()
+            .items_center()
+            .justify_end()
+            .child(collapse_button)
+            .into_any_element();
         let navigation = if self.sidebar.is_collapsed() {
             div().v_flex().gap_2()
         } else {
@@ -4130,15 +4191,15 @@ impl Render for LauncherApp {
             Page::Instances => self.instances_page(palette, locale, cx),
             Page::Mods => self.mods_page(palette, locale, cx),
             Page::Modpacks | Page::ResourcePacks | Page::Shaders => {
-                self.search_empty_page(palette, locale)
+                self.mods_page(palette, locale, cx)
             }
             Page::Settings => self.settings_page(palette, cx),
             Page::ModDetails => self.mod_details_page(palette, locale, cx),
         };
         let page_subtitle = match active_page {
             Page::Home => locale.text(
-                "Сборки, моды и ресурспаки для твоей игры",
-                "Modpacks, mods, and resource packs for your game",
+                "Моды, модпаки, текстурпаки и шейдеры для игры",
+                "Mods, modpacks, texture packs, and shaders for your game",
             ),
             Page::Instances => locale.text(
                 "Версия игры, загрузчик и установленные моды",
@@ -4148,12 +4209,23 @@ impl Render for LauncherApp {
                 "Найди дополнения для своей сборки",
                 "Find add-ons for your setup",
             ),
+            Page::Modpacks => locale.text(
+                "Готовые сборки модов для Minecraft",
+                "Ready-made Minecraft mod collections",
+            ),
+            Page::ResourcePacks => locale.text(
+                "Измени текстуры и оформление игры",
+                "Change the game's textures and appearance",
+            ),
+            Page::Shaders => locale.text(
+                "Найди шейдеры и измени графику игры",
+                "Find shaders and change the game's visuals",
+            ),
             Page::Settings => locale.text(
                 "Язык и оформление лаунчера",
                 "Launcher language and appearance",
             ),
             Page::ModDetails => "",
-            _ => locale.text("Здесь пока пусто", "Nothing here yet"),
         };
         let page_header = if active_page == Page::ModDetails {
             div().into_any_element()
@@ -4364,20 +4436,5 @@ fn detail_meta_row(
                         .child(value.into()),
                 ),
         )
-        .into_any_element()
-}
-
-fn brand_mark(palette: Palette, size: Pixels) -> AnyElement {
-    div()
-        .w(size)
-        .h(size)
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(8.))
-        .bg(rgb(palette.accent))
-        .text_color(rgb(palette.accent_foreground))
-        .text_size(px(if size.as_f32() < 28. { 14. } else { 20. }))
-        .child(IconName::Blocks)
         .into_any_element()
 }

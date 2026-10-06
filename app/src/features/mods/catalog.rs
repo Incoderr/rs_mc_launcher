@@ -3,7 +3,7 @@ use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt, Request};
 use serde::Deserialize;
 
-use super::{ModCategory, ModCompatibilityFilter, ModSort};
+use super::{CATALOG_PAGE_SIZE, ModCategory, ModCompatibilityFilter, ModSort, ProjectKind};
 use crate::features::settings::Locale;
 use gpui_kit::assets::IconName;
 
@@ -11,7 +11,6 @@ const MODRINTH_SEARCH_URL: &str = "https://api.modrinth.com/v2/search";
 const CURSEFORGE_SEARCH_URL: &str = "https://api.curseforge.com/v1/mods/search";
 const CURSEFORGE_MOD_DESCRIPTION_URL: &str = "https://api.curseforge.com/v1/mods";
 const CURSEFORGE_MINECRAFT_GAME_ID: u32 = 432;
-const CURSEFORGE_MODS_CLASS_ID: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModSource {
@@ -44,6 +43,7 @@ impl ModSource {
 #[derive(Clone, Debug)]
 pub struct ModProject {
     pub id: String,
+    pub kind: ProjectKind,
     pub source: ModSource,
     pub name: String,
     pub description: String,
@@ -76,6 +76,8 @@ pub struct CatalogProviderError {
 pub struct ModCatalogResult {
     pub projects: Vec<ModProject>,
     pub errors: Vec<CatalogProviderError>,
+    pub total_results: usize,
+    pub page_count: usize,
 }
 
 pub async fn fetch_project_description(
@@ -158,41 +160,86 @@ pub async fn search_catalog(
     source: ModSource,
     curseforge_api_key: Option<String>,
     compatibility_filter: Option<ModCompatibilityFilter>,
+    kind: ProjectKind,
+    page: usize,
 ) -> ModCatalogResult {
+    let provider_page_size = if source == ModSource::All {
+        CATALOG_PAGE_SIZE / 2
+    } else {
+        CATALOG_PAGE_SIZE
+    };
+    let offset = page.saturating_sub(1).saturating_mul(provider_page_size);
+    let compatibility_filter = (kind == ProjectKind::Mod)
+        .then_some(compatibility_filter)
+        .flatten();
     let (modrinth, curseforge) = match source {
         ModSource::All => {
             futures::join!(
-                search_modrinth(client.clone(), &query, sort, compatibility_filter.clone()),
+                search_modrinth(
+                    client.clone(),
+                    &query,
+                    sort,
+                    compatibility_filter.clone(),
+                    kind,
+                    offset,
+                    provider_page_size,
+                ),
                 search_curseforge(
                     client,
                     &query,
                     sort,
                     curseforge_api_key,
                     compatibility_filter,
+                    kind,
+                    offset,
+                    provider_page_size,
                 ),
             )
         }
         ModSource::Modrinth => (
-            search_modrinth(client, &query, sort, compatibility_filter).await,
-            Ok(Vec::new()),
+            search_modrinth(
+                client,
+                &query,
+                sort,
+                compatibility_filter,
+                kind,
+                offset,
+                provider_page_size,
+            )
+            .await,
+            Ok((Vec::new(), 0)),
         ),
         ModSource::CurseForge => (
-            Ok(Vec::new()),
+            Ok((Vec::new(), 0)),
             search_curseforge(
                 client,
                 &query,
                 sort,
                 curseforge_api_key,
                 compatibility_filter,
+                kind,
+                offset,
+                provider_page_size,
             )
             .await,
         ),
     };
 
     let mut result = ModCatalogResult::default();
-    let modrinth_projects = collect_provider_results(&mut result, ModSource::Modrinth, modrinth);
+    let (modrinth_projects, modrinth_total) =
+        collect_provider_results(&mut result, ModSource::Modrinth, modrinth);
     let curseforge_projects =
         collect_provider_results(&mut result, ModSource::CurseForge, curseforge);
+    let curseforge_total = curseforge_projects.1;
+    let curseforge_projects = curseforge_projects.0;
+    result.total_results = modrinth_total.saturating_add(curseforge_total);
+    result.page_count = if source == ModSource::All {
+        modrinth_total
+            .div_ceil(provider_page_size)
+            .max(curseforge_total.div_ceil(provider_page_size))
+    } else {
+        result.total_results.div_ceil(CATALOG_PAGE_SIZE)
+    };
 
     if source == ModSource::All && sort == ModSort::Popular {
         let count = modrinth_projects.len().max(curseforge_projects.len());
@@ -545,14 +592,14 @@ struct ModDownloadFile {
 fn collect_provider_results(
     result: &mut ModCatalogResult,
     provider: ModSource,
-    response: Result<Vec<ModProject>, CatalogProviderError>,
-) -> Vec<ModProject> {
+    response: Result<(Vec<ModProject>, usize), CatalogProviderError>,
+) -> (Vec<ModProject>, usize) {
     match response {
-        Ok(projects) => projects,
+        Ok(result) => result,
         Err(error) => {
             tracing::warn!(provider = provider.api_name(), message = %error.message, "mod catalog search failed");
             result.errors.push(error);
-            Vec::new()
+            (Vec::new(), 0)
         }
     }
 }
@@ -562,13 +609,16 @@ async fn search_modrinth(
     query: &str,
     sort: ModSort,
     compatibility_filter: Option<ModCompatibilityFilter>,
-) -> Result<Vec<ModProject>, CatalogProviderError> {
+    kind: ProjectKind,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<ModProject>, usize), CatalogProviderError> {
     let index = match sort {
         ModSort::Popular => "follows",
         ModSort::Downloads => "downloads",
         ModSort::Name => "relevance",
     };
-    let mut facets = vec![vec!["project_type:mod".to_owned()]];
+    let mut facets = vec![vec![format!("project_type:{}", kind.modrinth_type())]];
     if let Some(filter) = &compatibility_filter {
         facets.push(vec![format!("versions:{}", filter.game_version)]);
         facets.push(vec![format!(
@@ -583,8 +633,8 @@ async fn search_modrinth(
         )
     })?;
     let mut url = format!(
-        "{MODRINTH_SEARCH_URL}?facets={}&index={index}&limit=100",
-        encode_query_component(&facets)
+        "{MODRINTH_SEARCH_URL}?facets={}&index={index}&limit={limit}&offset={offset}",
+        encode_query_component(&facets),
     );
     if !query.trim().is_empty() {
         url.push_str("&query=");
@@ -599,17 +649,19 @@ async fn search_modrinth(
         )
     })?;
 
-    Ok(response
+    let projects = response
         .hits
         .into_iter()
         .map(|hit| {
-            let mut project = ModProject::from_modrinth(hit);
+            let mut project = ModProject::from_modrinth(hit, kind);
             if let Some(filter) = &compatibility_filter {
                 project.game_version = filter.game_version.clone();
             }
             project
         })
-        .collect())
+        .collect();
+
+    Ok((projects, response.total_hits))
 }
 
 async fn search_curseforge(
@@ -618,12 +670,15 @@ async fn search_curseforge(
     sort: ModSort,
     api_key: Option<String>,
     compatibility_filter: Option<ModCompatibilityFilter>,
-) -> Result<Vec<ModProject>, CatalogProviderError> {
+    kind: ProjectKind,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<ModProject>, usize), CatalogProviderError> {
     if compatibility_filter
         .as_ref()
         .is_some_and(|filter| filter.loader == super::ModLoaderFilter::Vanilla)
     {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) else {
@@ -640,7 +695,8 @@ async fn search_curseforge(
         ModSort::Name => 4,
     };
     let mut url = format!(
-        "{CURSEFORGE_SEARCH_URL}?gameId={CURSEFORGE_MINECRAFT_GAME_ID}&classId={CURSEFORGE_MODS_CLASS_ID}&pageSize=50&index=0&sortField={sort_field}&sortOrder=desc"
+        "{CURSEFORGE_SEARCH_URL}?gameId={CURSEFORGE_MINECRAFT_GAME_ID}&classId={}&pageSize={limit}&index={offset}&sortField={sort_field}&sortOrder=desc",
+        kind.curseforge_class_id(),
     );
     if let Some(filter) = &compatibility_filter {
         url.push_str("&gameVersion=");
@@ -661,17 +717,22 @@ async fn search_curseforge(
         )
     })?;
 
-    Ok(response
+    let total_results = response
+        .pagination
+        .map_or(0, |pagination| pagination.total_count);
+    let projects = response
         .data
         .into_iter()
         .map(|hit| {
-            let mut project = ModProject::from_curseforge(hit);
+            let mut project = ModProject::from_curseforge(hit, kind);
             if let Some(filter) = &compatibility_filter {
                 project.game_version = filter.game_version.clone();
             }
             project
         })
-        .collect())
+        .collect();
+
+    Ok((projects, total_results))
 }
 
 async fn request_body(
@@ -733,6 +794,8 @@ fn encode_query_component(value: &str) -> String {
 struct ModrinthSearchResponse {
     #[serde(default)]
     hits: Vec<ModrinthHit>,
+    #[serde(default)]
+    total_hits: usize,
 }
 
 #[derive(Deserialize)]
@@ -830,6 +893,14 @@ struct ModrinthHit {
 struct CurseForgeSearchResponse {
     #[serde(default)]
     data: Vec<CurseForgeMod>,
+    #[serde(default)]
+    pagination: Option<CurseForgePagination>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgePagination {
+    total_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -877,7 +948,7 @@ struct CurseForgeFileIndex {
 }
 
 impl ModProject {
-    fn from_modrinth(hit: ModrinthHit) -> Self {
+    fn from_modrinth(hit: ModrinthHit, kind: ProjectKind) -> Self {
         let categories = map_categories(hit.categories.iter().map(String::as_str));
         let loaders = hit
             .categories
@@ -886,9 +957,10 @@ impl ModProject {
             .map(|tag| display_loader(tag))
             .collect::<Vec<_>>();
         let slug = hit.slug.as_deref().unwrap_or(&hit.project_id);
-        let page_url = format!("https://modrinth.com/mod/{slug}");
+        let page_url = format!("https://modrinth.com/{}/{slug}", kind.modrinth_path());
         Self {
             id: format!("modrinth:{}", hit.project_id),
+            kind,
             source: ModSource::Modrinth,
             name: hit.title,
             description: hit.description,
@@ -915,7 +987,7 @@ impl ModProject {
         }
     }
 
-    fn from_curseforge(project: CurseForgeMod) -> Self {
+    fn from_curseforge(project: CurseForgeMod, kind: ProjectKind) -> Self {
         let raw_categories = project
             .categories
             .iter()
@@ -937,12 +1009,19 @@ impl ModProject {
             .first()
             .map(|author| author.name.clone())
             .unwrap_or_else(|| "Unknown".into());
+        let path = match kind {
+            ProjectKind::Mod => "mc-mods",
+            ProjectKind::Modpack => "modpacks",
+            ProjectKind::ResourcePack => "texture-packs",
+            ProjectKind::Shader => "shaders",
+        };
         let page_url = format!(
-            "https://www.curseforge.com/minecraft/mc-mods/{}",
+            "https://www.curseforge.com/minecraft/{path}/{}",
             project.slug
         );
         Self {
             id: format!("curseforge:{}", project.id),
+            kind,
             source: ModSource::CurseForge,
             name: project.name,
             description: project.summary,
