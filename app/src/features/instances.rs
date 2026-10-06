@@ -27,6 +27,9 @@ pub struct InstanceProfile {
     #[serde(default)]
     pub installation_root: PathBuf,
     pub installed_version_id: Option<String>,
+    /// Persisted logical launch order; zero means this profile has never been launched.
+    #[serde(default)]
+    pub last_launch_order: u64,
 }
 
 impl InstanceProfile {
@@ -47,6 +50,7 @@ impl InstanceProfile {
             java_path: None,
             installation_root,
             installed_version_id: None,
+            last_launch_order: 0,
         }
     }
 }
@@ -89,6 +93,7 @@ pub enum InstanceRuntime {
 pub struct InstancesState {
     profiles: Vec<InstanceProfile>,
     runtime: HashMap<Uuid, InstanceRuntime>,
+    worlds: HashMap<Uuid, super::worlds::WorldList>,
 }
 
 impl InstancesState {
@@ -104,20 +109,44 @@ impl InstancesState {
                 (profile.id, state)
             })
             .collect();
-        Self { profiles, runtime }
+        Self {
+            profiles,
+            runtime,
+            worlds: HashMap::new(),
+        }
     }
 
     pub fn profiles(&self) -> &[InstanceProfile] {
         &self.profiles
     }
 
+    pub fn recent_profiles(&self) -> Vec<&InstanceProfile> {
+        let mut profiles: Vec<_> = self.profiles.iter().collect();
+        profiles.sort_by_key(|profile| std::cmp::Reverse(profile.last_launch_order));
+        profiles
+    }
+
     pub fn profile(&self, id: Uuid) -> Option<&InstanceProfile> {
         self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    pub fn worlds(&self, id: Uuid) -> super::worlds::WorldList {
+        self.worlds
+            .get(&id)
+            .cloned()
+            .unwrap_or(super::worlds::WorldList::Loading)
+    }
+
+    pub fn set_worlds(&mut self, id: Uuid, worlds: super::worlds::WorldList) {
+        if self.profile(id).is_some() {
+            self.worlds.insert(id, worlds);
+        }
     }
 
     pub fn remove(&mut self, id: Uuid) -> Option<InstanceProfile> {
         let index = self.profiles.iter().position(|profile| profile.id == id)?;
         self.runtime.remove(&id);
+        self.worlds.remove(&id);
         Some(self.profiles.remove(index))
     }
 
@@ -247,6 +276,16 @@ impl InstancesState {
     }
 
     pub fn mark_running(&mut self, id: Uuid, process_id: u32) {
+        let next_order = self
+            .profiles
+            .iter()
+            .map(|profile| profile.last_launch_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) {
+            profile.last_launch_order = next_order;
+        }
         self.runtime
             .insert(id, InstanceRuntime::Running { process_id });
     }
@@ -428,10 +467,11 @@ pub fn install_profile(
 pub fn launch_profile(
     profile: InstanceProfile,
     minecraft_directory: PathBuf,
+    world: Option<String>,
     events: UnboundedSender<InstanceWorkerEvent>,
 ) {
     let id = profile.id;
-    let Some(version_id) = profile.installed_version_id else {
+    let Some(version_id) = profile.installed_version_id.clone() else {
         let _ = events.unbounded_send(InstanceWorkerEvent::LaunchFailed {
             id,
             message: "Профиль ещё не установлен".to_owned(),
@@ -488,10 +528,40 @@ pub fn launch_profile(
         return;
     }
 
+    let account = Account::offline("Player");
+    if let Err(message) =
+        super::skins::local::prepare(&profile, &game_directory, account.username())
+    {
+        let _ = events.unbounded_send(InstanceWorkerEvent::LaunchFailed { id, message });
+        return;
+    }
+
+    let quick_play_args = if let Some(world) = world {
+        let result = (|| {
+            let metadata = serde_json::to_value(&version).map_err(|error| error.to_string())?;
+            let args = rs_mc_launcher_core::minecraft::quick_play::singleplayer_arguments(
+                &metadata, &world,
+            )
+            .map_err(str::to_owned)?;
+            crate::platform::worlds::validate(&game_directory.join("saves"), &world)
+                .map_err(|error| format!("Не удалось открыть мир: {error}"))?;
+            Ok::<_, String>(args)
+        })();
+        match result {
+            Ok(args) => args,
+            Err(message) => {
+                let _ = events.unbounded_send(InstanceWorkerEvent::LaunchFailed { id, message });
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let command = match launcher.build_launch_command_from_version(
         &version,
         LaunchOptions {
-            account: Account::offline("Player"),
+            account,
             java_executable: profile.java_path.clone(),
             game_directory: Some(game_directory),
             ..Default::default()
@@ -521,6 +591,7 @@ pub fn launch_profile(
             .cloned(),
     );
 
+    launch_args.extend(quick_play_args);
     let mut process = Command::new(&command.executable);
     process
         .args(&launch_args)
@@ -692,4 +763,51 @@ pub fn remove_profile_data(profile: InstanceProfile, events: UnboundedSender<Ins
 
 fn default_memory_mb() -> u32 {
     4096
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(name: &str) -> InstanceProfile {
+        InstanceProfile::new(
+            name.into(),
+            "1.21".into(),
+            LoaderChoice::Vanilla,
+            None,
+            PathBuf::new(),
+        )
+    }
+
+    #[test]
+    fn successful_launches_sort_home_without_reordering_library() {
+        let first = profile("First");
+        let second = profile("Second");
+        let first_id = first.id;
+        let second_id = second.id;
+        let mut state = InstancesState::from_profiles(vec![first, second]);
+        state.mark_launching(second_id);
+        state.mark_failed(second_id, "Java missing".into());
+        assert_eq!(state.recent_profiles()[0].id, first_id);
+        state.mark_running(second_id, 42);
+        assert_eq!(state.recent_profiles()[0].id, second_id);
+        assert_eq!(state.profiles()[0].id, first_id);
+        let saved = serde_json::to_string(state.profiles()).unwrap();
+        let mut restored = InstancesState::from_profiles(serde_json::from_str(&saved).unwrap());
+        assert_eq!(restored.recent_profiles()[0].id, second_id);
+        restored.mark_running(first_id, 43);
+        assert_eq!(restored.recent_profiles()[0].id, first_id);
+        restored.remove(first_id);
+        assert_eq!(restored.recent_profiles()[0].id, second_id);
+    }
+
+    #[test]
+    fn old_profiles_keep_their_order_until_launched() {
+        let mut old = serde_json::to_value(profile("Old")).unwrap();
+        old.as_object_mut().unwrap().remove("last_launch_order");
+        let old: InstanceProfile = serde_json::from_value(old).unwrap();
+        assert_eq!(old.last_launch_order, 0);
+        let state = InstancesState::from_profiles(vec![old, profile("New")]);
+        assert_eq!(state.recent_profiles()[0].name, "Old");
+    }
 }

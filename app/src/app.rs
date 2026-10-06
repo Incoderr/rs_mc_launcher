@@ -21,7 +21,7 @@ use crate::{
 };
 use futures::StreamExt;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{Button as UiButton, StyledExt};
+use gpui_kit::base::{Button as UiButton, Disableable, StyledExt};
 use gpui_kit::component::button::Button as ComponentButton;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -33,6 +33,9 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::rc::Rc;
 use std::time::Duration;
+
+#[path = "skin_view.rs"]
+mod skin_view;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -109,16 +112,27 @@ impl SidebarState {
 pub struct LauncherApp {
     active_page: Page,
     settings: SettingsState,
+    skins: crate::features::skins::SkinState,
+    skin_yaw: f32,
+    skin_dragging: bool,
+    skin_last_x: f32,
+    skin_preview_request: Option<(uuid::Uuid, i16, crate::features::skins::SkinModel)>,
+    skin_thumbnails_pending:
+        std::collections::HashSet<(uuid::Uuid, crate::features::skins::SkinModel)>,
+    skin_message: Option<String>,
     mods: ModsState,
     versions: VersionCatalogState,
     instances: InstancesState,
     sidebar: SidebarState,
     search_input: Entity<InputState>,
+    mod_version_input: Entity<InputState>,
     profile_name_input: Entity<InputState>,
     loader_version_input: Entity<InputState>,
     manifest_scroll: gpui_kit::base::VirtualListScrollHandle,
     mods_scroll: gpui_kit::base::VirtualListScrollHandle,
     _search_subscription: Subscription,
+    _mod_version_subscription: Subscription,
+    tray_available: bool,
 }
 
 impl LauncherApp {
@@ -177,6 +191,15 @@ impl LauncherApp {
                 "Search by name, description, or author",
             ))
         });
+        let mod_version_input = cx.new(|cx| InputState::new(window, cx).placeholder("1.21.1"));
+        let mod_version_subscription =
+            cx.subscribe(&mod_version_input, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) && this.mods.target_profile().is_none() {
+                    this.mods
+                        .set_game_version_filter(input.read(cx).value().to_string());
+                    this.load_mod_catalog(cx, true);
+                }
+            });
         let profile_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale.text("Название профиля", "Profile name"))
         });
@@ -214,20 +237,40 @@ impl LauncherApp {
             }
         };
 
+        let tray_available = crate::shell::tray::install(window, cx.weak_entity(), cx);
+
         Self {
+            tray_available,
             active_page: Page::Home,
             settings,
+            skins: crate::features::skins::SkinState::load(),
+            skin_yaw: -0.24,
+            skin_dragging: false,
+            skin_last_x: 0.0,
+            skin_preview_request: None,
+            skin_thumbnails_pending: std::collections::HashSet::new(),
+            skin_message: None,
             mods: ModsState::default(),
             versions: VersionCatalogState::default(),
             instances,
             sidebar: SidebarState::default(),
             search_input,
+            mod_version_input,
             profile_name_input,
             loader_version_input,
             manifest_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             mods_scroll: gpui_kit::base::VirtualListScrollHandle::new(),
             _search_subscription: search_subscription,
+            _mod_version_subscription: mod_version_subscription,
         }
+    }
+
+    pub(crate) fn hide_to_tray(&self) -> bool {
+        self.settings.hide_to_tray()
+    }
+
+    pub(crate) fn tray_uses_english(&self) -> bool {
+        self.settings.locale() == Locale::En
     }
 
     fn set_locale(&mut self, locale: Locale, window: &mut Window, cx: &mut Context<Self>) {
@@ -389,9 +432,69 @@ impl LauncherApp {
         }
         self.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
         if page.catalog_kind().is_some() {
+            self.load_version_manifests(cx);
+            self.refresh_installed_mods(cx);
             self.load_mod_catalog(cx, false);
         }
         cx.notify();
+    }
+
+    fn refresh_installed_mods(&mut self, cx: &mut Context<Self>) {
+        for profile in self.instances.profiles().to_vec() {
+            let id = profile.id;
+            if self.mods.installed.is_loading(id)
+                || matches!(
+                    self.instances.runtime(&id),
+                    InstanceRuntime::DownloadingMod { .. }
+                        | InstanceRuntime::Removing
+                        | InstanceRuntime::Installing { .. }
+                )
+            {
+                continue;
+            }
+            let generation = self.mods.installed.begin(id);
+            let directory =
+                profile_store::instance_directory(&profile.installation_root, id).join("mods");
+            let key = std::env::var("CURSEFORGE_API_KEY").ok();
+            let task = cx.background_executor().spawn(async move {
+                crate::features::mods::installed::scan(&directory, key.as_deref())
+            });
+            cx.spawn(async move |this, cx| {
+                let inventory = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.instances.profile(id).is_some() {
+                        if let Some(warning) = &inventory.warning {
+                            tracing::warn!(profile_id = %id, %warning, "mod inventory incomplete");
+                        }
+                        this.mods.installed.finish(id, generation, inventory);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn installed_mod_label(&self, project: &str, locale: Locale) -> Option<String> {
+        if let Some(id) = self.mods.target_profile() {
+            self.mods
+                .installed
+                .contains(id, project)
+                .then(|| locale.text("Установлен", "Installed").to_owned())
+        } else {
+            let count = self
+                .instances
+                .profiles()
+                .iter()
+                .filter(|profile| self.mods.installed.contains(profile.id, project))
+                .count();
+            (count > 0).then(|| {
+                format!(
+                    "{} · {count}",
+                    locale.text("Установлен в сборках", "Installed in builds")
+                )
+            })
+        }
     }
 
     fn load_mod_catalog(&mut self, cx: &mut Context<Self>, debounce: bool) {
@@ -462,6 +565,10 @@ impl LauncherApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(id) = self.mods.target_profile() {
+            self.start_mod_download(project, id, cx);
+            return;
+        }
         let locale = self.settings.locale();
         let palette = Palette::for_settings(self.settings.theme(), self.settings.accent());
         let profiles = self
@@ -470,15 +577,21 @@ impl LauncherApp {
             .iter()
             .map(|profile| {
                 let runtime = self.instances.runtime(&profile.id);
-                let busy = matches!(
-                    runtime,
-                    InstanceRuntime::Installing { .. }
-                        | InstanceRuntime::DownloadingMod { .. }
-                        | InstanceRuntime::Launching
-                        | InstanceRuntime::Running { .. }
-                        | InstanceRuntime::Removing
-                );
-                (profile.clone(), busy)
+                let busy = self.mods.installed.contains(profile.id, &project.id)
+                    || self.mods.installed.is_loading(profile.id)
+                    || matches!(
+                        runtime,
+                        InstanceRuntime::Installing { .. }
+                            | InstanceRuntime::DownloadingMod { .. }
+                            | InstanceRuntime::Launching
+                            | InstanceRuntime::Running { .. }
+                            | InstanceRuntime::Removing
+                    );
+                (
+                    profile.clone(),
+                    busy,
+                    self.mods.installed.contains(profile.id, &project.id),
+                )
             })
             .collect::<Vec<_>>();
         let owner = cx.entity().downgrade();
@@ -531,10 +644,14 @@ impl LauncherApp {
 
                     let rows = content_profiles
                         .iter()
-                        .map(|(profile, busy)| {
+                        .map(|(profile, busy, installed)| {
                             let profile_id = profile.id;
                             let has_mod_loader = profile.loader != LoaderChoice::Vanilla;
-                            let profile_details = if !has_mod_loader {
+                            let profile_details = if *installed {
+                                locale
+                                    .text("Установлен в этой сборке", "Installed in this build")
+                                    .to_owned()
+                            } else if !has_mod_loader {
                                 locale
                                     .text(
                                         "Для модов нужна сборка с Fabric, Forge или NeoForge",
@@ -618,6 +735,11 @@ impl LauncherApp {
         profile_id: uuid::Uuid,
         cx: &mut Context<Self>,
     ) {
+        if self.mods.installed.contains(profile_id, &project.id)
+            || self.mods.installed.is_loading(profile_id)
+        {
+            return;
+        }
         let Some(profile) = self.instances.profile(profile_id).cloned() else {
             return;
         };
@@ -644,11 +766,12 @@ impl LauncherApp {
         let client = cx.http_client();
         let curseforge_api_key = std::env::var("CURSEFORGE_API_KEY").ok();
         let project_id = project.id;
+        let installed_project_id = project_id.clone();
         let source = project.source;
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let result = install_compatible_mod(
+        let download_task = cx.background_executor().spawn(async move {
+            install_compatible_mod(
                 client,
                 project_id,
                 source,
@@ -656,10 +779,14 @@ impl LauncherApp {
                 curseforge_api_key,
                 mods_directory,
             )
-            .await;
+            .await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = download_task.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(filename) => {
+                        this.mods.installed.mark_installed(profile_id, installed_project_id);
                         tracing::info!(profile_id = %profile_id, %filename, "installed mod into profile");
                         this.instances
                             .mark_mod_downloaded(profile_id, filename);
@@ -736,7 +863,91 @@ impl LauncherApp {
         cx.notify();
     }
 
+    fn open_world_picker(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::features::worlds::WorldList;
+        let Some(profile) = self.instances.profile(id).cloned() else {
+            return;
+        };
+        let locale = self.settings.locale();
+        let title = format!(
+            "{} · {}",
+            locale.text("Войти в мир", "Play a world"),
+            profile.name
+        );
+        self.instances.set_worlds(id, WorldList::Loading);
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::features::worlds::load(profile) });
+        cx.spawn(async move |this, cx| {
+            let worlds = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.instances.set_worlds(id, worlds);
+                cx.notify();
+            });
+        })
+        .detach();
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let owner = owner.clone();
+            dialog.title(title.clone()).content(move |content, _, cx| {
+                let worlds = owner
+                    .upgrade()
+                    .map(|owner| owner.read(cx).instances.worlds(id));
+                let body = match worlds {
+                    Some(WorldList::Ready(worlds)) if !worlds.is_empty() => div()
+                        .v_flex()
+                        .gap_2()
+                        .children(worlds.into_iter().map(|world| {
+                            let owner = owner.clone();
+                            let label = world.clone();
+                            ComponentButton::new(format!("quick-play-{world}"))
+                                .outline()
+                                .label(label)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.launch_into(id, Some(world.clone()), cx)
+                                    });
+                                })
+                        }))
+                        .into_any_element(),
+                    Some(WorldList::Ready(_)) => div()
+                        .child(locale.text(
+                            "Миров пока нет. Создай мир в игре — он появится здесь.",
+                            "No worlds yet. Create one in the game first.",
+                        ))
+                        .into_any_element(),
+                    Some(WorldList::Failed(error)) => div().child(error).into_any_element(),
+                    _ => div()
+                        .child(locale.text("Читаем сохранения…", "Loading worlds…"))
+                        .into_any_element(),
+                };
+                content.child(
+                    div()
+                        .p_4()
+                        .max_h(px(420.))
+                        .overflow_y_scrollbar()
+                        .child(body),
+                )
+            })
+        });
+    }
+
     fn start_profile_launch(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.launch_into(id, None, cx);
+    }
+
+    fn launch_into(&mut self, id: uuid::Uuid, world: Option<String>, cx: &mut Context<Self>) {
+        if matches!(
+            self.instances.runtime(&id),
+            InstanceRuntime::Installing { .. }
+                | InstanceRuntime::DownloadingMod { .. }
+                | InstanceRuntime::Launching
+                | InstanceRuntime::Running { .. }
+                | InstanceRuntime::Removing
+        ) {
+            return;
+        }
         let Some(profile) = self.instances.profile(id).cloned() else {
             return;
         };
@@ -750,7 +961,7 @@ impl LauncherApp {
         let (sender, receiver) = futures::channel::mpsc::unbounded();
         let worker = std::thread::Builder::new()
             .name(format!("launch-minecraft-{id}"))
-            .spawn(move || launch_profile(profile, minecraft_directory, sender));
+            .spawn(move || launch_profile(profile, minecraft_directory, world, sender));
 
         match worker {
             Ok(_) => self.listen_for_instance_events(receiver, cx),
@@ -818,6 +1029,9 @@ impl LauncherApp {
             }
             InstanceWorkerEvent::ProfileRemoved { id } => {
                 self.instances.remove(id);
+                if self.mods.target_profile() == Some(id) {
+                    self.mods.clear_compatibility_filter();
+                }
                 self.persist_profiles();
             }
             InstanceWorkerEvent::ProfileRemovalFailed { id, message } => {
@@ -825,6 +1039,7 @@ impl LauncherApp {
             }
             InstanceWorkerEvent::Launched { id, process_id } => {
                 self.instances.mark_running(id, process_id);
+                self.persist_profiles();
             }
             InstanceWorkerEvent::GameExited { id, code, stderr } => {
                 self.instances.mark_game_stopped(id, code, stderr);
@@ -1872,131 +2087,122 @@ impl LauncherApp {
     }
 
     fn home_page(&self, palette: Palette, locale: Locale, cx: &Context<Self>) -> AnyElement {
-        let destinations: Vec<_> = [
-            Page::Modpacks,
-            Page::Mods,
-            Page::ResourcePacks,
-            Page::Shaders,
-        ]
-        .into_iter()
-        .map(|page| self.destination_card(page, palette, locale, cx))
-        .collect();
-
-        let popular_cards: Vec<_> = SAMPLE_MODS
-            .iter()
-            .take(3)
-            .map(|sample| self.home_mod_card(sample, palette, locale))
-            .collect();
-
         div()
             .v_flex()
             .w_full()
             .flex_1()
             .min_h_0()
             .overflow_y_scrollbar()
-            .gap_5()
+            .gap_4()
+            .when(self.instances.profiles().is_empty(), |this| {
+                this.child(
+                    div().v_flex().items_start().gap_3().p_6()
+                        .rounded(px(12.)).bg(rgb(palette.surface))
+                        .border_1().border_color(rgb(palette.border))
+                        .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD)
+                            .child(locale.text("Создай первую сборку", "Create your first build")))
+                        .child(div().text_size(px(13.)).text_color(rgb(palette.muted))
+                            .child(locale.text("Выбери версию Minecraft. Здесь появятся твои сборки и кнопки запуска.", "Choose a Minecraft version. Your builds and launch controls will appear here.")))
+                        .child(UiButton::new("home-create-build")
+                            .px_4().py_3().rounded(px(8.))
+                            .bg(rgb(palette.accent)).text_color(rgb(palette.accent_foreground))
+                            .hover(|style| style.opacity(0.9))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_version_picker(window, cx)))
+                            .child(locale.text("Создать сборку", "Create build"))),
+                )
+            })
+            .when(!self.instances.profiles().is_empty(), |this| {
+                this.child(self.instances_section(palette, locale, cx))
+            })
+            .into_any_element()
+    }
+    fn download_indicator(
+        &self,
+        summary: crate::features::downloads::DownloadSummary,
+        palette: Palette,
+        locale: Locale,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let title = format!(
+            "{} · {}",
+            locale.text("Загрузки и установка", "Downloads and installation"),
+            summary.active_count
+        );
+        let detail = if summary.active_count == 1 {
+            let mut detail = summary.profile_name;
+            if let Some(task) = summary.task {
+                detail.push_str(&format!(" · {task}"));
+            }
+            if let Some((received, total)) = summary.current_file
+                && (received > 0 || total.is_some())
+            {
+                detail.push_str(&format!(
+                    " · {}: {}",
+                    locale.text("текущий файл", "current file"),
+                    format_bytes(received)
+                ));
+                if let Some(total) = total {
+                    detail.push_str(&format!(" / {}", format_bytes(total)));
+                }
+            }
+            detail
+        } else {
+            locale
+                .text(
+                    "Открыть сборки и посмотреть прогресс",
+                    "Open builds to see progress",
+                )
+                .to_owned()
+        };
+        UiButton::new("global-downloads")
+            .w_full()
+            .flex_shrink_0()
+            .px_4()
+            .py_3()
+            .rounded(px(10.))
+            .bg(rgb(palette.surface))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .text_color(rgb(palette.foreground))
+            .hover(|style| style.bg(rgb(palette.hover)))
+            .accessibility_label(format!("{title}. {detail}"))
+            .on_click(
+                cx.listener(|this, _, window, cx| this.navigate_to(Page::Instances, window, cx)),
+            )
             .child(
                 div()
                     .h_flex()
                     .w_full()
                     .items_center()
-                    .gap_5()
-                    .p_6()
-                    .rounded(px(12.))
-                    .bg(rgb(palette.surface))
-                    .border_1()
-                    .border_color(rgb(palette.border))
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_color(rgb(palette.accent))
+                            .child(IconName::Download),
+                    )
                     .child(
                         div()
                             .v_flex()
                             .flex_1()
-                            .gap_3()
+                            .min_w_0()
+                            .items_start()
+                            .gap_1()
                             .child(
                                 div()
-                                    .text_size(px(22.))
+                                    .text_size(px(12.))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(palette.foreground))
-                                    .child(locale.text(
-                                        "Играй в Minecraft по-своему",
-                                        "Make Minecraft yours",
-                                    )),
+                                    .child(title),
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(11.))
                                     .text_color(rgb(palette.muted))
-                                    .child(locale.text(
-                                    "Моды, модпаки, текстурпаки и шейдеры — в одном лаунчере.",
-                                    "Mods, modpacks, texture packs, and shaders in one launcher.",
-                                )),
-                            )
-                            .child(
-                                UiButton::new("home-browse-mods")
-                                    .px_4()
-                                    .py_3()
-                                    .rounded(px(8.))
-                                    .bg(rgb(palette.accent))
-                                    .text_color(rgb(palette.accent_foreground))
-                                    .hover(|style| style.opacity(0.9))
-                                    .active(|style| style.opacity(0.78))
-                                    .accessibility_label(
-                                        locale.text("Открыть каталог модов", "Browse mods"),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.navigate_to(Page::Mods, window, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                locale.text("Открыть каталог модов", "Browse mods"),
-                                            )
-                                            .child(IconName::ArrowRight),
-                                    ),
+                                    .child(detail),
                             ),
                     )
-                    .child(
-                        div()
-                            .w(px(112.))
-                            .h(px(112.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(14.))
-                            .bg(rgb(palette.accent))
-                            .text_color(rgb(palette.accent_foreground))
-                            .text_size(px(58.))
-                            .child(IconName::Blocks),
-                    ),
-            )
-            .child(
-                div()
-                    .h_flex()
-                    .w_full()
-                    .gap_3()
-                    .children(destinations)
-                    .child(self.add_version_card(palette, locale, cx)),
-            )
-            .when(!self.instances.profiles().is_empty(), |this| {
-                this.child(self.instances_section(palette, locale, cx))
-            })
-            .child(
-                div()
-                    .v_flex()
-                    .gap_3()
-                    .child(
-                        div()
-                            .h_flex()
-                            .items_center()
-                            .gap_2()
-                            .text_color(rgb(palette.foreground))
-                            .font_weight(FontWeight::BOLD)
-                            .child(IconName::Star)
-                            .child(locale.text("Популярные моды", "Popular mods")),
-                    )
-                    .child(div().h_flex().w_full().gap_3().children(popular_cards)),
+                    .child(IconName::ChevronRight),
             )
             .into_any_element()
     }
@@ -2083,8 +2289,8 @@ impl LauncherApp {
     ) -> AnyElement {
         let cards = self
             .instances
-            .profiles()
-            .iter()
+            .recent_profiles()
+            .into_iter()
             .map(|profile| self.instance_card(profile, palette, locale, cx))
             .collect::<Vec<_>>();
 
@@ -2359,7 +2565,7 @@ impl LauncherApp {
                             .hover(|style| style.bg(rgb(palette.hover)))
                             .disabled(is_busy)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.mods.set_compatibility_filter(mod_filter.clone());
+                                this.mods.select_profile(profile_id, mod_filter.clone());
                                 this.navigate_to(Page::Mods, window, cx);
                             }))
                             .child(
@@ -2396,6 +2602,23 @@ impl LauncherApp {
                                     .child(action_text),
                             ),
                     )
+                    .when(
+                        is_installed
+                            && rs_mc_launcher_core::minecraft::quick_play::potentially_supported(
+                                &profile.game_version,
+                            ),
+                        |row| {
+                            row.child(
+                                ComponentButton::new(format!("world-instance-{profile_id}"))
+                                    .outline()
+                                    .label(locale.text("В мир…", "World…"))
+                                    .disabled(is_busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_world_picker(profile_id, window, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         UiButton::new(format!("settings-instance-{profile_id}"))
                             .px_3()
@@ -2422,129 +2645,6 @@ impl LauncherApp {
                                 this.open_delete_profile_confirmation(profile_id, window, cx);
                             }))
                             .child(IconName::Delete),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn destination_card(
-        &self,
-        page: Page,
-        palette: Palette,
-        locale: Locale,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let description = match page {
-            Page::Modpacks => locale.text("Готовые сборки", "Curated collections"),
-            Page::Mods => locale.text("Дополнения для игры", "Add-ons for your game"),
-            Page::ResourcePacks => locale.text("Новые текстуры", "New textures"),
-            Page::Shaders => locale.text("Новая графика", "New visuals"),
-            _ => "",
-        };
-
-        UiButton::new(format!("home-{}", page.element_id()))
-            .flex_1()
-            .px_4()
-            .py_4()
-            .rounded(px(10.))
-            .bg(rgb(palette.surface))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .text_color(rgb(palette.foreground))
-            .hover(|style| style.bg(rgb(palette.hover)))
-            .active(|style| style.bg(rgb(palette.pressed)))
-            .accessibility_label(page.title(locale))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.navigate_to(page, window, cx);
-            }))
-            .child(
-                div()
-                    .v_flex()
-                    .w_full()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(19.))
-                            .text_color(rgb(palette.accent))
-                            .child(page.icon()),
-                    )
-                    .child(
-                        div()
-                            .v_flex()
-                            .items_start()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(page.title(locale)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(palette.muted))
-                                    .child(description),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn add_version_card(&self, palette: Palette, locale: Locale, cx: &Context<Self>) -> AnyElement {
-        let detail = self.versions.selected_version().map_or_else(
-            || {
-                locale
-                    .text("Добавить версию игры", "Add a game version")
-                    .to_string()
-            },
-            str::to_owned,
-        );
-
-        UiButton::new("home-add-minecraft-version")
-            .flex_1()
-            .px_4()
-            .py_4()
-            .rounded(px(10.))
-            .bg(rgb(palette.surface))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .text_color(rgb(palette.foreground))
-            .hover(|style| style.bg(rgb(palette.hover)))
-            .active(|style| style.bg(rgb(palette.pressed)))
-            .accessibility_label(locale.text("Добавить Minecraft", "Add Minecraft"))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_version_picker(window, cx);
-            }))
-            .child(
-                div()
-                    .v_flex()
-                    .w_full()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(19.))
-                            .text_color(rgb(palette.accent))
-                            .child(IconName::Plus),
-                    )
-                    .child(
-                        div()
-                            .v_flex()
-                            .items_start()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(locale.text("Добавить", "Add")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(palette.muted))
-                                    .child(detail),
-                            ),
                     ),
             )
             .into_any_element()
@@ -2717,11 +2817,11 @@ impl LauncherApp {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new(ModSort::Name.title(locale))
-                        .checked(selected_sort == ModSort::Name)
+                    PopupMenuItem::new(ModSort::Relevance.title(locale))
+                        .checked(selected_sort == ModSort::Relevance)
                         .on_click(move |_, _, cx| {
                             let _ = sort_owner_name.update(cx, |this, cx| {
-                                this.mods.set_sort(ModSort::Name);
+                                this.mods.set_sort(ModSort::Relevance);
                                 this.mods_scroll.scroll_to_item(0, ScrollStrategy::Top);
                                 this.load_mod_catalog(cx, false);
                                 cx.notify();
@@ -2873,56 +2973,320 @@ impl LauncherApp {
             None
         };
 
-        div()
+        let target_name = self
+            .mods
+            .target_profile()
+            .and_then(|id| self.instances.profile(id))
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| locale.text("Все сборки", "All builds").into());
+        let profiles = self.instances.profiles().to_vec();
+        let target_owner = cx.weak_entity();
+        let target_menu = ComponentButton::new("catalog-target")
+            .outline()
+            .label(target_name)
+            .dropdown_menu(move |mut menu, _, _| {
+                let clear_owner = target_owner.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(locale.text("Все сборки", "All builds")).on_click(
+                        move |_, _, cx| {
+                            let _ = clear_owner.update(cx, |this, cx| {
+                                this.mods.clear_compatibility_filter();
+                                this.load_mod_catalog(cx, false);
+                            });
+                        },
+                    ),
+                );
+                for profile in &profiles {
+                    let id = profile.id;
+                    let filter = ModCompatibilityFilter {
+                        game_version: profile.game_version.clone(),
+                        loader: mod_loader_filter(profile.loader),
+                    };
+                    let owner = target_owner.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!(
+                            "{} · {} · {}",
+                            profile.name,
+                            profile.game_version,
+                            mod_loader_filter(profile.loader).title(locale)
+                        ))
+                        .on_click(move |_, _, cx| {
+                            let _ = owner.update(cx, |this, cx| {
+                                this.mods.select_profile(id, filter.clone());
+                                this.refresh_installed_mods(cx);
+                                this.load_mod_catalog(cx, false);
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
+        let filters = self.mods.search_filters();
+        let loaders = [
+            None,
+            Some(ModLoaderFilter::Fabric),
+            Some(ModLoaderFilter::Forge),
+            Some(ModLoaderFilter::NeoForge),
+        ]
+        .into_iter()
+        .map(|loader| {
+            let selected = filters.loader == loader;
+            let label = loader.map_or(
+                locale.text("Все загрузчики", "All loaders"),
+                |loader| loader.title(locale),
+            );
+            UiButton::new(format!("catalog-loader-{loader:?}"))
+                .w_full()
+                .px_3()
+                .py_2()
+                .rounded(px(6.))
+                .bg(rgb(if selected {
+                    palette.selected
+                } else {
+                    palette.surface
+                }))
+                .text_color(rgb(if selected {
+                    palette.accent
+                } else {
+                    palette.muted
+                }))
+                .selected(selected)
+                .disabled(self.mods.target_profile().is_some())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.mods.set_loader_filter(loader);
+                    this.load_mod_catalog(cx, false);
+                }))
+                .child(label)
+        });
+        let filter_count = usize::from(filters.game_version.is_some())
+            + usize::from(filters.loader.is_some())
+            + usize::from(selected_category != ModCategory::All)
+            + usize::from(selected_source != ModSource::All);
+        let version_query = self.mod_version_input.read(cx).value().to_string();
+        let version_choices: Vec<_> = self
+            .versions
+            .manifest()
+            .into_iter()
+            .flat_map(|manifest| &manifest.versions)
+            .filter(|version| {
+                version.version_type == "release" && version.id.contains(version_query.trim())
+            })
+            .take(12)
+            .map(|version| {
+                let id = version.id.clone();
+                UiButton::new(format!("catalog-version-{id}"))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(
+                        if filters.game_version.as_deref() == Some(id.as_str()) {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        },
+                    ))
+                    .disabled(self.mods.target_profile().is_some())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.mod_version_input
+                            .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
+                    }))
+                    .child(version.id.clone())
+            })
+            .collect();
+        let filters_panel = div()
             .v_flex()
-            .w_full()
-            .flex_1()
+            .w(px(190.))
+            .flex_shrink_0()
             .min_h_0()
-            .min_w_0()
-            .gap_4()
-            .child(self.search_bar(palette, locale))
-            .when_some(target_filter_chip, |this, chip| this.child(chip))
+            .overflow_y_scrollbar()
+            .p_3()
+            .gap_3()
+            .rounded(px(10.))
+            .bg(rgb(palette.surface))
+            .border_1()
+            .border_color(rgb(palette.border))
             .child(
                 div()
                     .h_flex()
-                    .w_full()
-                    .items_center()
                     .justify_between()
+                    .items_center()
                     .child(
                         div()
-                            .h_flex()
-                            .items_center()
-                            .gap_2()
                             .text_size(px(13.))
-                            .text_color(rgb(palette.muted))
-                            .child(selected_kind.title(locale))
+                            .font_weight(FontWeight::BOLD)
                             .child(format!(
-                                "({} / {})",
-                                visible_count,
-                                self.mods.total_results()
-                            ))
-                            .when(self.mods.is_loading(), |this| {
-                                this.child(IconName::LoaderCircle)
-                            }),
+                                "{} · {filter_count}",
+                                locale.text("Фильтры", "Filters")
+                            )),
                     )
-                    .child(sort_menu),
+                    .child(
+                        UiButton::new("reset-catalog-filters")
+                            .text_size(px(10.))
+                            .text_color(rgb(palette.muted))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.mods.reset_filters();
+                                this.mod_version_input
+                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                                this.load_mod_catalog(cx, false);
+                            }))
+                            .child(locale.text("Сбросить", "Reset")),
+                    ),
             )
-            .child(div().h_flex().w_full().gap_2().children(sources))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(locale.text("Версия Minecraft", "Minecraft version")),
+            )
+            .child(
+                Input::new(&self.mod_version_input)
+                    .w_full()
+                    .disabled(self.mods.target_profile().is_some())
+                    .aria_label(locale.text("Точная версия Minecraft", "Exact Minecraft version")),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .max_h(px(112.))
+                    .overflow_y_scrollbar()
+                    .children(version_choices),
+            )
+            .when(self.mods.target_profile().is_some(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(palette.muted))
+                        .child(locale.text(
+                            "Версия и загрузчик взяты из сборки",
+                            "Version and loader follow the build",
+                        )),
+                )
+            })
             .when(selected_kind == ProjectKind::Mod, |this| {
                 this.child(
                     div()
-                        .h_flex()
-                        .w_full()
-                        .h(px(38.))
-                        .gap_2()
-                        .overflow_x_scrollbar()
-                        .children(categories),
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(locale.text("Загрузчик", "Loader")),
+                )
+                .child(div().v_flex().gap_1().children(loaders))
+                .child(div().h(px(1.)).bg(rgb(palette.border)))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(locale.text("Категории", "Categories")),
+                )
+                .child(div().v_flex().gap_1().children(categories))
+            })
+            .child(div().h(px(1.)).bg(rgb(palette.border)))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(locale.text("Источник", "Source")),
+            )
+            .child(div().v_flex().gap_1().children(sources));
+        let checking = self
+            .instances
+            .profiles()
+            .iter()
+            .any(|profile| self.mods.installed.is_loading(profile.id));
+        let incomplete = self
+            .instances
+            .profiles()
+            .iter()
+            .any(|profile| self.mods.installed.warning(profile.id).is_some());
+        div().h_flex().items_stretch().w_full().flex_1().min_h_0().min_w_0().gap_4()
+            .child(filters_panel)
+            .child(div().v_flex().flex_1().min_h_0().min_w_0().gap_3()
+                .child(self.search_bar(palette, locale))
+                .when(selected_kind == ProjectKind::Mod, |this| this.child(div().h_flex().items_center().gap_2()
+                    .child(div().text_size(px(12.)).text_color(rgb(palette.muted)).child(locale.text("Установка в", "Install into")))
+                    .child(target_menu)))
+                .when_some(target_filter_chip, |this, chip| this.child(chip))
+                .child(div().h_flex().w_full().items_center().justify_between()
+                    .child(div().h_flex().items_center().gap_2().text_size(px(12.)).text_color(rgb(palette.muted))
+                        .child(format!("{} {}", self.mods.total_results(), selected_kind.title(locale)))
+                        .when(is_loading, |this| this.child(locale.text("· Загрузка…", "· Loading…"))))
+                    .child(sort_menu))
+                .when(checking || incomplete, |this| this.child(div().h_flex().items_center().gap_2()
+                    .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(if checking {
+                        locale.text("Проверяем установленные моды…", "Checking installed mods…")
+                    } else { locale.text("Не все файлы удалось распознать. Отметки могут быть неполными.", "Some files could not be identified. Installed markers may be incomplete.") }))
+                    .when(!checking, |this| this.child(UiButton::new("retry-mod-inventory").text_size(px(11.))
+                        .on_click(cx.listener(|this, _, _, cx| { this.refresh_installed_mods(cx); cx.notify(); }))
+                        .child(locale.text("Проверить снова", "Check again"))))))
+                .children(errors).when_some(retry, |this, button| this.child(button))
+                .child(cards_content).child(pagination))
+            .into_any_element()
+    }
+    fn mod_install_action(
+        &self,
+        project: &ModProject,
+        palette: Palette,
+        locale: Locale,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let installed = self.installed_mod_label(&project.id, locale);
+        let target = self.mods.target_profile();
+        let checking = self.instances.profiles().iter().any(|profile| {
+            target.is_none_or(|id| profile.id == id) && self.mods.installed.is_loading(profile.id)
+        });
+        let busy = target.is_some_and(|id| {
+            matches!(
+                self.instances.runtime(&id),
+                InstanceRuntime::Installing { .. }
+                    | InstanceRuntime::DownloadingMod { .. }
+                    | InstanceRuntime::Launching
+                    | InstanceRuntime::Running { .. }
+                    | InstanceRuntime::Removing
+            )
+        });
+        let already_installed = target.is_some() && installed.is_some();
+        let download_project = project.clone();
+        div()
+            .v_flex()
+            .items_end()
+            .gap_2()
+            .when_some(installed, |this, label| {
+                this.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(palette.accent))
+                        .child(label),
                 )
             })
-            .children(errors)
-            .when_some(retry, |this, button| this.child(button))
-            .child(cards_content)
-            .child(pagination)
+            .child(
+                UiButton::new(format!("install-project-{}", project.id))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(7.))
+                    .bg(rgb(if already_installed {
+                        palette.control
+                    } else {
+                        palette.accent
+                    }))
+                    .text_color(rgb(if already_installed {
+                        palette.muted
+                    } else {
+                        palette.accent_foreground
+                    }))
+                    .disabled(already_installed || busy || checking)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_mod_download_dialog(download_project.clone(), window, cx)
+                    }))
+                    .child(if checking {
+                        locale.text("Проверяем…", "Checking…")
+                    } else if already_installed {
+                        locale.text("Установлен", "Installed")
+                    } else if busy {
+                        locale.text("Сборка занята", "Build busy")
+                    } else {
+                        locale.text("Установить", "Install")
+                    }),
+            )
             .into_any_element()
     }
 
@@ -3050,19 +3414,7 @@ impl LauncherApp {
             );
 
         let action = if project.kind == ProjectKind::Mod {
-            let download_project = project.clone();
-            UiButton::new(format!("download-mod-{project_id}"))
-                .px_3()
-                .py_2()
-                .rounded(px(7.))
-                .bg(rgb(palette.accent))
-                .text_color(rgb(palette.accent_foreground))
-                .hover(|style| style.opacity(0.9))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_mod_download_dialog(download_project.clone(), window, cx);
-                }))
-                .child(locale.text("Скачать", "Download"))
-                .into_any_element()
+            self.mod_install_action(project, palette, locale, cx)
         } else {
             let page_url = project.page_url.clone();
             UiButton::new(format!("open-project-{project_id}"))
@@ -3174,20 +3526,7 @@ impl LauncherApp {
             .collect();
 
         let primary_action = if project_kind == ProjectKind::Mod {
-            let download_project = sample.clone();
-            UiButton::new(format!("details-download-{}", sample.id))
-                .px_3()
-                .py_2()
-                .rounded(px(7.))
-                .bg(rgb(palette.accent))
-                .text_color(rgb(palette.accent_foreground))
-                .hover(|style| style.opacity(0.9))
-                .accessibility_label(locale.text("Скачать мод", "Download mod"))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_mod_download_dialog(download_project.clone(), window, cx);
-                }))
-                .child(locale.text("Скачать", "Download"))
-                .into_any_element()
+            self.mod_install_action(sample, palette, locale, cx)
         } else {
             let page_url = project_url.clone();
             UiButton::new(format!("open-project-page-{}", sample.id))
@@ -3705,7 +4044,8 @@ impl LauncherApp {
             .child(locale.text("Выбрать…", "Choose…"));
 
         let hide_to_tray = Switch::new("settings-hide-to-tray")
-            .checked(self.settings.hide_to_tray())
+            .checked(self.tray_available && self.settings.hide_to_tray())
+            .disabled(!self.tray_available)
             .color(rgb(palette.accent))
             .accessibility_label(locale.text("Скрывать в трей", "Hide to tray"))
             .on_change(cx.listener(|this, checked, _, cx| {
@@ -3851,10 +4191,14 @@ impl LauncherApp {
                                         div()
                                             .text_size(px(11.))
                                             .text_color(rgb(palette.muted))
-                                            .child(locale.text(
-                                                "При закрытии окна оставить лаунчер в фоне",
-                                                "Keep the launcher running when the window closes",
-                                            )),
+                                            .child(if self.tray_available {
+                                                locale.text(
+                                                    "Крестик скрывает окно. Нажми значок в трее, чтобы вернуться; «Выйти» — в его меню.",
+                                                    "Close hides the window. Click the tray icon to return; use its menu to exit.",
+                                                )
+                                            } else {
+                                                locale.text("Трей недоступен в этой системе", "Tray is unavailable on this system")
+                                            }),
                                     ),
                             ),
                     )
@@ -4194,12 +4538,13 @@ impl Render for LauncherApp {
                 self.mods_page(palette, locale, cx)
             }
             Page::Settings => self.settings_page(palette, cx),
+            Page::Skins => skin_view::skin_page(self, palette, locale, cx),
             Page::ModDetails => self.mod_details_page(palette, locale, cx),
         };
         let page_subtitle = match active_page {
             Page::Home => locale.text(
-                "Моды, модпаки, текстурпаки и шейдеры для игры",
-                "Mods, modpacks, texture packs, and shaders for your game",
+                "Твои сборки — недавно запущенные первыми",
+                "Your builds — recently played first",
             ),
             Page::Instances => locale.text(
                 "Версия игры, загрузчик и установленные моды",
@@ -4224,6 +4569,10 @@ impl Render for LauncherApp {
             Page::Settings => locale.text(
                 "Язык и оформление лаунчера",
                 "Launcher language and appearance",
+            ),
+            Page::Skins => locale.text(
+                "Загружай и выбирай скины персонажа",
+                "Upload and choose your character skins",
             ),
             Page::ModDetails => "",
         };
@@ -4283,7 +4632,15 @@ impl Render for LauncherApp {
                     .p_8()
                     .gap_6()
                     .child(page_header)
-                    .child(page_body),
+                    .child(page_body)
+                    .when_some(
+                        crate::features::downloads::DownloadSummary::from_instances(
+                            &self.instances,
+                        ),
+                        |this, summary| {
+                            this.child(self.download_indicator(summary, palette, locale, cx))
+                        },
+                    ),
             )
     }
 }

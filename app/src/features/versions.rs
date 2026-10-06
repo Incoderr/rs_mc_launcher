@@ -63,10 +63,6 @@ impl VersionCatalogState {
         self.error.as_deref()
     }
 
-    pub fn selected_version(&self) -> Option<&str> {
-        self.selected_version.as_deref()
-    }
-
     pub fn loader_choice(&self) -> LoaderChoice {
         self.loader_choice
     }

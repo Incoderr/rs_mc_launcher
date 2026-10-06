@@ -1,3 +1,8 @@
 pub mod manifest_cache;
+pub mod mod_files;
 pub mod process;
 pub mod profile_store;
+pub mod skin_store;
+#[cfg(target_os = "windows")]
+pub mod tray;
+pub mod worlds;

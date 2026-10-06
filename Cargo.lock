@@ -5963,7 +5963,9 @@ dependencies = [
  "futures",
  "gpui-devtools",
  "gpui-kit",
+ "image",
  "mc-launcher-core",
+ "raw-window-handle",
  "reqwest",
  "rs-mc-launcher-core",
  "serde",
@@ -5971,12 +5973,14 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
+ "windows 0.61.3",
 ]
 
 [[package]]
 name = "rs-mc-launcher-core"
 version = "0.1.0"
 dependencies = [
+ "image",
  "quick-xml",
  "serde",
  "serde_json",

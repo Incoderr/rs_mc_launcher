@@ -27,6 +27,7 @@ uuid = { version = "1.23.1", features = ["serde", "v4"] }
 tempfile = "3"
 
 [profile.dev.package]
+rs-mc-launcher-core = { opt-level = 3 }
 gpui-pre = { opt-level = 3 }
 gpui-component = { opt-level = 3 }
 gpui-kit = { opt-level = 3 }

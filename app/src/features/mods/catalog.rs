@@ -3,7 +3,9 @@ use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt, Request};
 use serde::Deserialize;
 
-use super::{CATALOG_PAGE_SIZE, ModCategory, ModCompatibilityFilter, ModSort, ProjectKind};
+use super::{
+    CATALOG_PAGE_SIZE, ModCategory, ModCompatibilityFilter, ModSearchFilters, ModSort, ProjectKind,
+};
 use crate::features::settings::Locale;
 use gpui_kit::assets::IconName;
 
@@ -159,7 +161,7 @@ pub async fn search_catalog(
     sort: ModSort,
     source: ModSource,
     curseforge_api_key: Option<String>,
-    compatibility_filter: Option<ModCompatibilityFilter>,
+    compatibility_filter: ModSearchFilters,
     kind: ProjectKind,
     page: usize,
 ) -> ModCatalogResult {
@@ -169,9 +171,6 @@ pub async fn search_catalog(
         CATALOG_PAGE_SIZE
     };
     let offset = page.saturating_sub(1).saturating_mul(provider_page_size);
-    let compatibility_filter = (kind == ProjectKind::Mod)
-        .then_some(compatibility_filter)
-        .flatten();
     let (modrinth, curseforge) = match source {
         ModSource::All => {
             futures::join!(
@@ -373,6 +372,15 @@ pub async fn install_compatible_mod(
             format!("Could not install the downloaded mod: {}", error.error),
         )
     })?;
+
+    super::installed::record_install(&mods_directory, project_id, &file.filename).map_err(
+        |error| {
+            provider_error(
+                source,
+                format!("Mod saved, but could not record installation: {error}"),
+            )
+        },
+    )?;
 
     Ok(file.filename)
 }
@@ -604,11 +612,27 @@ fn collect_provider_results(
     }
 }
 
+fn modrinth_facets(kind: ProjectKind, filters: &ModSearchFilters) -> Vec<Vec<String>> {
+    let mut facets = vec![vec![format!("project_type:{}", kind.modrinth_type())]];
+    if let Some(version) = &filters.game_version {
+        facets.push(vec![format!("versions:{version}")]);
+    }
+    if kind == ProjectKind::Mod {
+        if let Some(loader) = filters.loader {
+            facets.push(vec![format!("categories:{}", loader.modrinth_slug())]);
+        }
+        if let Some(category) = filters.category.modrinth_slug() {
+            facets.push(vec![format!("categories:{category}")]);
+        }
+    }
+    facets
+}
+
 async fn search_modrinth(
     client: Arc<dyn HttpClient>,
     query: &str,
     sort: ModSort,
-    compatibility_filter: Option<ModCompatibilityFilter>,
+    compatibility_filter: ModSearchFilters,
     kind: ProjectKind,
     offset: usize,
     limit: usize,
@@ -616,16 +640,9 @@ async fn search_modrinth(
     let index = match sort {
         ModSort::Popular => "follows",
         ModSort::Downloads => "downloads",
-        ModSort::Name => "relevance",
+        ModSort::Relevance => "relevance",
     };
-    let mut facets = vec![vec![format!("project_type:{}", kind.modrinth_type())]];
-    if let Some(filter) = &compatibility_filter {
-        facets.push(vec![format!("versions:{}", filter.game_version)]);
-        facets.push(vec![format!(
-            "categories:{}",
-            filter.loader.modrinth_slug()
-        )]);
-    }
+    let facets = modrinth_facets(kind, &compatibility_filter);
     let facets = serde_json::to_string(&facets).map_err(|error| {
         provider_error(
             ModSource::Modrinth,
@@ -654,8 +671,8 @@ async fn search_modrinth(
         .into_iter()
         .map(|hit| {
             let mut project = ModProject::from_modrinth(hit, kind);
-            if let Some(filter) = &compatibility_filter {
-                project.game_version = filter.game_version.clone();
+            if let Some(game_version) = &compatibility_filter.game_version {
+                project.game_version = game_version.clone();
             }
             project
         })
@@ -669,15 +686,12 @@ async fn search_curseforge(
     query: &str,
     sort: ModSort,
     api_key: Option<String>,
-    compatibility_filter: Option<ModCompatibilityFilter>,
+    compatibility_filter: ModSearchFilters,
     kind: ProjectKind,
     offset: usize,
     limit: usize,
 ) -> Result<(Vec<ModProject>, usize), CatalogProviderError> {
-    if compatibility_filter
-        .as_ref()
-        .is_some_and(|filter| filter.loader == super::ModLoaderFilter::Vanilla)
-    {
+    if compatibility_filter.loader == Some(super::ModLoaderFilter::Vanilla) {
         return Ok((Vec::new(), 0));
     }
 
@@ -692,17 +706,56 @@ async fn search_curseforge(
     let sort_field = match sort {
         ModSort::Popular => 2,
         ModSort::Downloads => 6,
-        ModSort::Name => 4,
+        ModSort::Relevance => 1,
     };
     let mut url = format!(
         "{CURSEFORGE_SEARCH_URL}?gameId={CURSEFORGE_MINECRAFT_GAME_ID}&classId={}&pageSize={limit}&index={offset}&sortField={sort_field}&sortOrder=desc",
         kind.curseforge_class_id(),
     );
-    if let Some(filter) = &compatibility_filter {
+    if let Some(game_version) = &compatibility_filter.game_version {
         url.push_str("&gameVersion=");
-        url.push_str(&encode_query_component(&filter.game_version));
-        url.push_str("&modLoaderType=");
-        url.push_str(&filter.loader.curseforge_id().to_string());
+        url.push_str(&encode_query_component(game_version));
+    }
+    if let Some(loader) = compatibility_filter.loader {
+        // The plural filter also works without selecting a game version.
+        url.push_str("&modLoaderTypes=");
+        url.push_str(&encode_query_component(&format!(
+            "[{}]",
+            loader.curseforge_id()
+        )));
+    }
+    if kind == ProjectKind::Mod
+        && let Some(slug) = compatibility_filter.category.curseforge_slug()
+    {
+        let body = request_body(
+            client.clone(),
+            "https://api.curseforge.com/v1/categories?gameId=432&classId=6",
+            Some(&api_key),
+            ModSource::CurseForge,
+        )
+        .await?;
+        #[derive(Deserialize)]
+        struct Category {
+            id: u64,
+            slug: String,
+        }
+        #[derive(Deserialize)]
+        struct Categories {
+            data: Vec<Category>,
+        }
+        let categories: Categories = serde_json::from_str(&body)
+            .map_err(|error| provider_error(ModSource::CurseForge, error.to_string()))?;
+        let category = categories
+            .data
+            .iter()
+            .find(|category| category.slug == slug)
+            .ok_or_else(|| {
+                provider_error(
+                    ModSource::CurseForge,
+                    "This category is not available from CurseForge.".into(),
+                )
+            })?;
+        url.push_str(&format!("&categoryId={}", category.id));
     }
     if !query.trim().is_empty() {
         url.push_str("&searchFilter=");
@@ -725,8 +778,8 @@ async fn search_curseforge(
         .into_iter()
         .map(|hit| {
             let mut project = ModProject::from_curseforge(hit, kind);
-            if let Some(filter) = &compatibility_filter {
-                project.game_version = filter.game_version.clone();
+            if let Some(game_version) = &compatibility_filter.game_version {
+                project.game_version = game_version.clone();
             }
             project
         })
@@ -1148,7 +1201,29 @@ fn date_label(date: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{CurseForgeMod, ModProject, ModSource, ModrinthHit, encode_query_component};
-    use crate::features::mods::ModCategory;
+    use crate::features::mods::{ModCategory, ProjectKind};
+
+    #[test]
+    fn search_filters_are_combined_on_the_server() {
+        let filters = super::ModSearchFilters {
+            game_version: Some("1.21.1".into()),
+            loader: Some(crate::features::mods::ModLoaderFilter::Fabric),
+            category: ModCategory::Optimization,
+        };
+        assert_eq!(
+            super::modrinth_facets(ProjectKind::Mod, &filters),
+            vec![
+                vec!["project_type:mod"],
+                vec!["versions:1.21.1"],
+                vec!["categories:fabric"],
+                vec!["categories:optimization"]
+            ]
+        );
+        assert_eq!(
+            super::modrinth_facets(ProjectKind::Shader, &filters),
+            vec![vec!["project_type:shader"], vec!["versions:1.21.1"]]
+        );
+    }
 
     #[test]
     fn maps_modrinth_search_hit_into_catalog_project() {
@@ -1170,7 +1245,7 @@ mod tests {
         )
         .expect("valid Modrinth search hit");
 
-        let project = ModProject::from_modrinth(hit);
+        let project = ModProject::from_modrinth(hit, ProjectKind::Mod);
 
         assert_eq!(project.source, ModSource::Modrinth);
         assert_eq!(project.name, "Example Mod");
@@ -1201,7 +1276,7 @@ mod tests {
         )
         .expect("valid CurseForge search hit");
 
-        let project = ModProject::from_curseforge(hit);
+        let project = ModProject::from_curseforge(hit, ProjectKind::Mod);
 
         assert_eq!(project.source, ModSource::CurseForge);
         assert_eq!(project.author, "Example Author");

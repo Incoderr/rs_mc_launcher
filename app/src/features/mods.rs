@@ -2,6 +2,48 @@ use crate::features::settings::Locale;
 use gpui_kit::assets::IconName;
 
 pub mod catalog;
+pub mod installed;
+
+#[derive(Clone, Debug, Default)]
+pub struct ModSearchFilters {
+    pub game_version: Option<String>,
+    pub loader: Option<ModLoaderFilter>,
+    pub category: ModCategory,
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    #[test]
+    fn filters_reset_pagination_reject_old_responses_and_follow_the_target_build() {
+        let mut state = ModsState {
+            page_count: 10,
+            ..Default::default()
+        };
+        state.set_page(5);
+        let old = state.begin_search().0;
+        state.set_category(ModCategory::Magic);
+        assert_eq!(state.page(), 1);
+        assert!(!state.finish_search(old, catalog::ModCatalogResult::default()));
+        state.set_game_version_filter("1.20.1".into());
+        state.select_profile(
+            uuid::Uuid::new_v4(),
+            ModCompatibilityFilter {
+                game_version: "1.21.1".into(),
+                loader: ModLoaderFilter::Fabric,
+            },
+        );
+        assert_eq!(
+            state.search_filters().game_version.as_deref(),
+            Some("1.21.1")
+        );
+        state.reset_filters();
+        assert!(state.target_profile().is_none());
+        assert!(state.search_filters().game_version.is_none());
+        assert!(state.search_filters().loader.is_none());
+        assert_eq!(state.category(), ModCategory::All);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModCategory {
@@ -53,6 +95,31 @@ impl ModCategory {
             Self::Rpg => "RPG",
         }
     }
+
+    pub(crate) fn modrinth_slug(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Adventure => Some("adventure"),
+            Self::Technology => Some("technology"),
+            Self::Decoration => Some("decoration"),
+            Self::Optimization => Some("optimization"),
+            Self::Libraries => Some("library"),
+            Self::Magic => Some("magic"),
+            Self::Rpg => Some("adventure"),
+        }
+    }
+
+    pub(crate) fn curseforge_slug(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Adventure | Self::Rpg => Some("adventure-rpg"),
+            Self::Technology => Some("technology"),
+            Self::Decoration => Some("cosmetic"),
+            Self::Optimization => Some("performance"),
+            Self::Libraries => Some("library-api"),
+            Self::Magic => Some("magic"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,7 +127,7 @@ pub enum ModSort {
     #[default]
     Popular,
     Downloads,
-    Name,
+    Relevance,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -157,7 +224,7 @@ impl ModSort {
         match self {
             Self::Popular => locale.text("Популярные", "Popular"),
             Self::Downloads => locale.text("По загрузкам", "Most downloaded"),
-            Self::Name => locale.text("По названию", "Name"),
+            Self::Relevance => locale.text("По совпадению", "Relevance"),
         }
     }
 }
@@ -286,6 +353,7 @@ pub const SAMPLE_MODS: &[ModSample] = &[
 
 #[derive(Debug, Default)]
 pub struct ModsState {
+    pub installed: installed::InstalledState,
     kind: ProjectKind,
     category: ModCategory,
     sort: ModSort,
@@ -299,6 +367,9 @@ pub struct ModsState {
     loading: bool,
     request_id: u64,
     compatibility_filter: Option<ModCompatibilityFilter>,
+    target_profile: Option<uuid::Uuid>,
+    game_version_filter: Option<String>,
+    loader_filter: Option<ModLoaderFilter>,
     selected_mod: Option<catalog::ModProject>,
     full_description: Option<String>,
     description_loading: bool,
@@ -319,6 +390,7 @@ impl ModsState {
             self.page = 0;
             if kind != ProjectKind::Mod {
                 self.compatibility_filter = None;
+                self.target_profile = None;
             }
             self.invalidate_search();
         }
@@ -347,11 +419,13 @@ impl ModsState {
     pub fn set_category(&mut self, category: ModCategory) {
         self.category = category;
         self.page = 0;
+        self.invalidate_search();
     }
 
     pub fn set_sort(&mut self, sort: ModSort) {
         self.sort = sort;
         self.page = 0;
+        self.invalidate_search();
     }
 
     pub fn page(&self) -> usize {
@@ -375,6 +449,58 @@ impl ModsState {
         self.compatibility_filter.as_ref()
     }
 
+    pub fn target_profile(&self) -> Option<uuid::Uuid> {
+        self.target_profile
+    }
+
+    pub fn select_profile(&mut self, id: uuid::Uuid, filter: ModCompatibilityFilter) {
+        self.target_profile = Some(id);
+        self.set_compatibility_filter(filter);
+    }
+
+    pub fn search_filters(&self) -> ModSearchFilters {
+        let mut filters = ModSearchFilters {
+            game_version: self
+                .compatibility_filter
+                .as_ref()
+                .map(|f| f.game_version.clone())
+                .or_else(|| self.game_version_filter.clone()),
+            loader: self
+                .compatibility_filter
+                .as_ref()
+                .map(|f| f.loader)
+                .or(self.loader_filter),
+            category: self.category,
+        };
+        if self.kind != ProjectKind::Mod {
+            filters.loader = None;
+            filters.category = ModCategory::All;
+        }
+        filters
+    }
+
+    pub fn set_game_version_filter(&mut self, version: String) {
+        self.game_version_filter = (!version.trim().is_empty()).then(|| version.trim().to_owned());
+        self.page = 0;
+        self.invalidate_search();
+    }
+
+    pub fn set_loader_filter(&mut self, loader: Option<ModLoaderFilter>) {
+        self.loader_filter = loader;
+        self.page = 0;
+        self.invalidate_search();
+    }
+
+    pub fn reset_filters(&mut self) {
+        self.category = ModCategory::All;
+        self.source = catalog::ModSource::All;
+        self.game_version_filter = None;
+        self.loader_filter = None;
+        self.clear_compatibility_filter();
+        self.page = 0;
+        self.invalidate_search();
+    }
+
     pub fn set_compatibility_filter(&mut self, filter: ModCompatibilityFilter) {
         if self.compatibility_filter.as_ref() != Some(&filter) {
             self.compatibility_filter = Some(filter);
@@ -384,6 +510,7 @@ impl ModsState {
     }
 
     pub fn clear_compatibility_filter(&mut self) {
+        self.target_profile = None;
         if self.compatibility_filter.take().is_some() {
             self.page = 0;
             self.invalidate_search();
@@ -480,7 +607,7 @@ impl ModsState {
         String,
         ModSort,
         catalog::ModSource,
-        Option<ModCompatibilityFilter>,
+        ModSearchFilters,
         ProjectKind,
         usize,
     ) {
@@ -492,7 +619,7 @@ impl ModsState {
             self.query.clone(),
             self.sort,
             self.source,
-            self.compatibility_filter.clone(),
+            self.search_filters(),
             self.kind,
             self.page(),
         )
@@ -515,29 +642,14 @@ impl ModsState {
     }
 
     pub fn visible_mods(&self) -> Vec<&catalog::ModProject> {
-        let query = self.query.trim().to_lowercase();
-        let mut mods: Vec<_> = self
-            .projects
-            .iter()
-            .filter(|project| {
-                (self.source == catalog::ModSource::All || project.source == self.source)
-                    && (self.category == ModCategory::All
-                        || project.categories.contains(&self.category))
-                    && (query.is_empty()
-                        || project.name.to_lowercase().contains(&query)
-                        || project.author.to_lowercase().contains(&query)
-                        || project.description.to_lowercase().contains(&query))
-            })
-            .collect();
+        let mut mods: Vec<_> = self.projects.iter().collect();
 
         match self.sort {
             // Provider popularity metrics differ (follows on Modrinth and
             // popularity rank on CurseForge), so retain each provider's rank.
             ModSort::Popular => {}
             ModSort::Downloads => mods.sort_by_key(|project| std::cmp::Reverse(project.downloads)),
-            ModSort::Name => {
-                mods.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            }
+            ModSort::Relevance => {}
         }
 
         mods
@@ -547,5 +659,8 @@ impl ModsState {
         self.request_id = self.request_id.wrapping_add(1);
         self.loading = false;
         self.errors.clear();
+        self.projects.clear();
+        self.total_results = 0;
+        self.page_count = 0;
     }
 }

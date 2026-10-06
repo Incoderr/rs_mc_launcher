@@ -10,15 +10,17 @@ pub enum Page {
     ResourcePacks,
     Shaders,
     Settings,
+    Skins,
     ModDetails,
 }
 
 impl Page {
-    pub const LIBRARY: [Self; 6] = [
+    pub const LIBRARY: [Self; 7] = [
         Self::Home,
         Self::Instances,
         Self::Modpacks,
         Self::Mods,
+        Self::Skins,
         Self::ResourcePacks,
         Self::Shaders,
     ];
@@ -32,6 +34,7 @@ impl Page {
             Self::ResourcePacks => locale.text("Текстурпаки", "Texture packs"),
             Self::Shaders => locale.text("Шейдеры", "Shaders"),
             Self::Settings => locale.text("Настройки", "Settings"),
+            Self::Skins => locale.text("Скины", "Skins"),
             Self::ModDetails => locale.text("Проект", "Project"),
         }
     }
@@ -55,6 +58,7 @@ impl Page {
             Self::ResourcePacks => "nav-resource-packs",
             Self::Shaders => "nav-shaders",
             Self::Settings => "nav-settings",
+            Self::Skins => "nav-skins",
             Self::ModDetails => "nav-mod-details",
         }
     }
@@ -68,6 +72,7 @@ impl Page {
             Self::ResourcePacks => IconName::Paintbrush,
             Self::Shaders => IconName::Sun,
             Self::Settings => IconName::Settings,
+            Self::Skins => IconName::Paintbrush,
             Self::ModDetails => IconName::BookOpen,
         }
     }

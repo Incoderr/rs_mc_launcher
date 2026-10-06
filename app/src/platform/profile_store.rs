@@ -98,7 +98,10 @@ fn settings_path() -> std::io::Result<PathBuf> {
     Ok(data_directory()?.join("settings.json"))
 }
 
-fn write_json_atomically<T: Serialize + ?Sized>(path: &Path, value: &T) -> std::io::Result<()> {
+pub(crate) fn write_json_atomically<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -118,7 +121,7 @@ fn write_json_atomically<T: Serialize + ?Sized>(path: &Path, value: &T) -> std::
         .map_err(|error| error.error)
 }
 
-fn data_directory() -> std::io::Result<PathBuf> {
+pub(crate) fn data_directory() -> std::io::Result<PathBuf> {
     let root = dirs::data_local_dir()
         .or_else(dirs::data_dir)
         .ok_or_else(|| {
